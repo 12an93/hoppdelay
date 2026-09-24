@@ -32,6 +32,11 @@ import evdev
 import gi
 import numpy as np
 
+try:  # optional: AI body pose (pip install onnxruntime + model, see README)
+    import onnxruntime
+except ImportError:
+    onnxruntime = None
+
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst
 
@@ -56,6 +61,8 @@ EVENT_PRE_S, EVENT_POST_S, EVENT_GAP_S = 4.0, 2.0, 1.5
 LLM_URL = os.environ.get("HOPPDELAY_LLM_URL", "")
 LLM_MODEL = os.environ.get("HOPPDELAY_LLM_MODEL", "qwen3:8b")
 LLM_KEY = os.environ.get("HOPPDELAY_LLM_KEY", "")
+# Optional AI body pose: RTMPose-m (Apache-2.0, OpenMMLab), 17 COCO keypoints, run on the CPU.
+POSE_MODEL = REC / "models" / "rtmpose-m.onnx"
 
 E = evdev.ecodes
 KEYMAP = {  # key -> command (same commands as the web page)
@@ -267,12 +274,12 @@ def foreground(cam, t0, t1, rot, factor):
     diff = lambda img: cv2.absdiff(cv2.GaussianBlur(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), (5, 5), 0), gbg) > 30
     busy = np.mean([diff(s) for s in sample], axis=0) > 0.35
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    yield None, bg, None
+    yield None, bg, None, None
     for t, ref in zip(ts, refs):
         img = decode(cam.read(ref), factor, rot)
         m = (diff(img) & ~busy).astype(np.uint8)
         m = cv2.morphologyEx(cv2.morphologyEx(m, cv2.MORPH_OPEN, kernel), cv2.MORPH_CLOSE, kernel, iterations=2)
-        yield t, img, m
+        yield t, img, m, ref
 
 
 def largest_blob(mask, min_area):
@@ -291,7 +298,7 @@ def stromotion(cam, t0, t1, rot, every):
         return None
     out = head[1].copy()
     min_area = out.shape[0] * out.shape[1] // 2000
-    for i, (t, img, m) in enumerate(frames):
+    for i, (t, img, m, _) in enumerate(frames):
         if i % every:
             continue
         blob = largest_blob(m, min_area)
@@ -318,7 +325,7 @@ def track(cam, t0, t1, rot):
     if head is None:
         return points
     min_area = head[1].shape[0] * head[1].shape[1] // 2000
-    for t, img, m in frames:
+    for t, img, m, _ in frames:
         blob = largest_blob(m, min_area)
         if blob is None:
             continue
@@ -330,6 +337,110 @@ def track(cam, t0, t1, rot):
         points.append({"t": t, "x": cx * factor, "y": cy * factor, "angle": float(np.degrees(0.5 * np.arctan2(2 * b, a - c))),
                        "elong": float(np.sqrt(l1 / l2)) if l2 > 1e-6 else 99.0})
     return points
+
+
+# --- AI body pose (RTMPose) ------------------------------------------------------------------
+POSE_MEAN, POSE_STD = np.float32([123.675, 116.28, 103.53]), np.float32([58.395, 57.12, 57.375])
+POSE_IN_W, POSE_IN_H = 192, 256
+NOSE, SHO, ELB, WRI, HIP, KNE, ANK = 0, (5, 6), (7, 8), (9, 10), (11, 12), (13, 14), (15, 16)
+pose_lock, pose_sess = threading.Lock(), None
+
+
+def pose_available():
+    return onnxruntime is not None and POSE_MODEL.exists()
+
+
+def rtmpose(img):
+    # 17 keypoints (x, y, score) of the person filling `img`, same pre/post-processing as rtmlib.
+    global pose_sess
+    with pose_lock:
+        if pose_sess is None:
+            pose_sess = onnxruntime.InferenceSession(str(POSE_MODEL), providers=["CPUExecutionProvider"])
+    h, w = img.shape[:2]
+    bw, bh = w * 1.25, h * 1.25
+    if bw > bh * POSE_IN_W / POSE_IN_H:
+        bh = bw * POSE_IN_H / POSE_IN_W
+    else:
+        bw = bh * POSE_IN_W / POSE_IN_H
+    k = POSE_IN_W / bw
+    m = np.float32([[k, 0, POSE_IN_W / 2 - k * w / 2], [0, k, POSE_IN_H / 2 - k * h / 2]])
+    inp = cv2.warpAffine(img, m, (POSE_IN_W, POSE_IN_H), flags=cv2.INTER_LINEAR).astype(np.float32)
+    inp = ((inp - POSE_MEAN) / POSE_STD).transpose(2, 0, 1)[None]
+    sx, sy = pose_sess.run(None, {pose_sess.get_inputs()[0].name: np.ascontiguousarray(inp)})
+    locs = np.stack([sx[0].argmax(1), sy[0].argmax(1)], 1) / 2.0  # SimCC split ratio 2
+    score = (sx[0].max(1) + sy[0].max(1)) / 2
+    return np.column_stack([(locs - m[:, 2]) / k, score])
+
+
+def joint(kp, pair):
+    # Mean of the left and right joint, weighted by confidence; None if neither is seen.
+    a, b = kp[pair[0]], kp[pair[1]]
+    wa, wb = max(a[2], 0), max(b[2], 0)
+    if wa + wb < 0.6:
+        return None
+    return (a[:2] * wa + b[:2] * wb) / (wa + wb)
+
+
+def angle_at(a, b, c):
+    if a is None or b is None or c is None:
+        return None
+    v1, v2 = a - b, c - b
+    n = np.linalg.norm(v1) * np.linalg.norm(v2)
+    return float(np.degrees(np.arccos(np.clip(v1 @ v2 / n, -1, 1)))) if n > 0 else None
+
+
+def plausible(a, b, c):
+    # Thigh and shin are about equally long; a much shorter segment is a keypoint that went wrong.
+    if a is None or b is None or c is None:
+        return False
+    l1, l2 = np.linalg.norm(a - b), np.linalg.norm(c - b)
+    return l1 > 0 and 0.5 < l2 / l1 < 2.0
+
+
+def body_pose(cam, t0, t1, rot):
+    # Keypoints and joint angles per frame. The diver is cut out and turned upright first (from the
+    # body axis found by the tracking), because pose models are trained on people standing up.
+    factor, out = analysis_factor(cam), []
+    frames = foreground(cam, t0, t1, rot, factor)
+    head = next(frames, None)
+    if head is None:
+        return out
+    min_area = head[1].shape[0] * head[1].shape[1] // 2000
+    found = []  # first pass: where the diver is in each frame, and her biggest size in the whole dive
+    for t, small, m, ref in frames:
+        blob = largest_blob(m, min_area)
+        if blob is not None:
+            ys, xs = np.nonzero(blob)
+            found.append((t, ref, blob, xs, ys, max(xs.max() - xs.min(), ys.max() - ys.min())))
+    biggest = max((f[5] for f in found), default=0)
+    for t, ref, blob, xs, ys, extent in found:
+        mo = cv2.moments(blob, binaryImage=True)
+        axis = np.degrees(0.5 * np.arctan2(2 * mo["mu11"], mo["mu20"] - mo["mu02"]))
+        l1, l2 = mo["mu20"] + mo["mu02"], np.hypot(mo["mu20"] - mo["mu02"], 2 * mo["mu11"])
+        elong = np.sqrt((l1 + l2) / max(l1 - l2, 1e-6))
+        full = decode(cam.read(ref), 1, rot)
+        cx, cy = (xs.min() + xs.max()) / 2 * factor, (ys.min() + ys.max()) / 2 * factor
+        # generous: limbs in front of a similar background (the board, a wall) can be missing from the mask
+        size = int(max(extent * 1.8, biggest * 1.4) * factor + 32)
+        turns = [axis - 90, axis + 90] + ([axis, axis + 180] if elong < 1.6 else [])  # upright, and upside down
+        best = None
+        for turn in turns:
+            mat = cv2.getRotationMatrix2D((cx, cy), turn, 1.0)
+            mat[:, 2] += (size / 2 - cx, size / 2 - cy)
+            kp = rtmpose(cv2.warpAffine(full, mat, (size, size)))
+            if best is None or kp[:, 2].mean() > best[0][:, 2].mean():
+                best = (kp, mat)
+        kp, mat = best
+        inv = cv2.invertAffineTransform(mat)
+        kp[:, :2] = kp[:, :2] @ inv[:, :2].T + inv[:, 2]  # back to picture coordinates
+        sho, hip, kne, ank = joint(kp, SHO), joint(kp, HIP), joint(kp, KNE), joint(kp, ANK)
+        if not plausible(hip, kne, ank):  # e.g. the ankle collapsed onto the knee when the model was unsure
+            ank = None
+        trunk = float(np.degrees(np.arctan2(*(sho - hip)[::-1]))) if sho is not None and hip is not None else None
+        line = float(np.degrees(np.arctan2(*(sho - ank)[::-1]))) if sho is not None and ank is not None else None
+        out.append({"t": t, "kp": np.round(kp, 1).tolist(), "score": float(kp[:, 2].mean()),
+                    "hip": angle_at(sho, hip, kne), "knee": angle_at(hip, kne, ank), "trunk": trunk, "line": line})
+    return out
 
 
 class Detector(threading.Thread):
@@ -612,6 +723,8 @@ a{color:#58a6ff}#tls{background:#1c2a3a;border-radius:12px;padding:12px 14px;mar
 <img id="stroimg" hidden style="width:100%;border-radius:8px"><div id="strotip" class="note" hidden></div>
 <button onclick="analyse()" style="width:100%">Analysera bana och rotation</button>
 <div id="trk" class="box" hidden></div>
+<button id="poseb" onclick="poseAnalyse()" hidden style="width:100%;margin-top:8px">Analysera kroppen (AI)</button>
+<div id="pose" class="box" hidden></div>
 <button id="fbb" onclick="feedback()" hidden style="width:100%;margin-top:8px">Skriv feedback (AI)</button>
 <div id="fb" class="box" hidden></div>
 <h3>Spara</h3>
@@ -662,7 +775,7 @@ function u(){fetch('/api/state').then(r=>r.json()).then(s=>{S=s;
  if($('rots').innerHTML!==rh)$('rots').innerHTML=rh;
  if($('rcam').options.length!==s.cams.length)$('rcam').innerHTML=s.cams.map(k=>'<option value="'+k.idx+'">Kamera '+(k.idx+1)+'</option>').join('');
  $('asb').textContent='Spara automatiskt: '+(s.autosave?'på':'av');$('asb').classList.toggle('on',s.autosave);
- $('tvoff').classList.toggle('on',s.tvrep);$('fbb').hidden=!s.llm;
+ $('tvoff').classList.toggle('on',s.tvrep);$('fbb').hidden=!s.llm;$('poseb').hidden=!s.pose;
  $('zinfo').textContent=s.zone?'Zonen är aktiv: varje hopp genom den hamnar i listan.':'Rita en zon: ta en repris från kamera 1, välj Zon och tryck två hörn i luften framför svikten, där bara hopparen passerar.';})}
 $('lay').onclick=e=>{const b=e.target.closest('button');if(b)c('layout/'+b.dataset.l);};
 setInterval(u,500);u();
@@ -728,8 +841,8 @@ function grab(){loadReplay(+$('rcam').value||0,S.tv-$('len').value,S.tv);}
 async function loadReplay(cam,t0,t1){
  const r=await(await fetch('/api/range/'+cam+'/'+t0+'/'+t1)).json();
  if(!r.times.length){$('rp').hidden=false;$('info').textContent='Inget inspelat i det intervallet ännu';return;}
- const k={cam,times:r.times,blobs:[],bm:new Map(),rot:S.cams[cam].rot,i:0,playing:false,speed:1,pos:0,marks:{},track:null};
- ['stroimg','strotip','trk','fb'].forEach(id=>$(id).hidden=true);
+ const k={cam,times:r.times,blobs:[],bm:new Map(),rot:S.cams[cam].rot,i:0,playing:false,speed:1,pos:0,marks:{},track:null,pose:null};
+ ['stroimg','strotip','trk','fb','pose'].forEach(id=>$(id).hidden=true);
  R=k;$('rp').hidden=false;$('rs').max=k.times.length-1;setSpeed(1);$('pl').textContent='▶︎';showPhys();
  A1.items=[];A1.pts=[];$('mk').querySelectorAll('button').forEach(x=>x.classList.remove('on')); // new dive: fresh marks and drawings
  let next=0,done=0;
@@ -756,6 +869,13 @@ async function draw(){const k=R,n=k&&k.i;if(!k||!k.blobs[n])return;
   if(Math.abs(cur.t-now)<0.05){x.beginPath();x.arc(cur.x,cur.y,lw*3,0,7);x.fill();
    const r=lw*30,ang=cur.angle*Math.PI/180;x.beginPath();x.moveTo(cur.x-r*Math.cos(ang),cur.y-r*Math.sin(ang));x.lineTo(cur.x+r*Math.cos(ang),cur.y+r*Math.sin(ang));x.stroke();}
   x.restore();}
+ if(k.pose){const now=k.times[n],f=k.pose.reduce((a,b)=>Math.abs(b.t-now)<Math.abs(a.t-now)?b:a);
+  if(Math.abs(f.t-now)<0.02){const lw=Math.max(2,w/300);x.save();x.strokeStyle=x.fillStyle='#ff7b72';x.lineWidth=lw;
+   for(const[a,b]of EDGES){const p=f.kp[a],q=f.kp[b];if(p[2]>0.3&&q[2]>0.3){x.beginPath();x.moveTo(p[0],p[1]);x.lineTo(q[0],q[1]);x.stroke();}}
+   f.kp.forEach(p=>{if(p[2]>0.3){x.beginPath();x.arc(p[0],p[1],lw*1.5,0,7);x.fill();}});
+   if(f.hip!=null){const hp=f.kp[11][2]>f.kp[12][2]?f.kp[11]:f.kp[12];x.font='bold '+Math.round(w/40)+'px sans-serif';
+    x.shadowColor='#000';x.shadowBlur=lw*2;x.fillText(Math.round(f.hip)+'°',hp[0]+lw*5,hp[1]);}
+   x.restore();}}
  A1.paint(x);
  const here=Object.keys(k.marks).filter(m=>Math.abs(k.marks[m]-rel(n))<1e-6)
   .map(m=>({takeoff:'Upphopp',apex:'Topp',open:'Öppning',water:'Vatten'}[m]));
@@ -812,10 +932,45 @@ function trackText(pts,k){
  else s+='<br><small>Rotation: kan inte mätas (kroppen syns inte som avlång).</small>';
  if(!SCALE)s+='<br><small>Kalibrera för att få meter.</small>';
  return s;}
+// AI body pose: skeleton per frame, hip and knee angles, opening, rotation of the trunk, entry line
+const EDGES=[[5,7],[7,9],[6,8],[8,10],[5,6],[5,11],[6,12],[11,12],[11,13],[13,15],[12,14],[14,16],[0,5],[0,6]];
+async function poseAnalyse(){if(!R)return;const k=R,[t0,t1]=diveRange(0.1);$('pose').hidden=false;
+ $('pose').textContent='AI:n analyserar kroppen… (några sekunder)';
+ const r=await fetch('/api/pose?cam='+k.cam+'&t0='+t0+'&t1='+t1+'&rot='+k.rot);if(k!==R)return;
+ if(!r.ok){$('pose').textContent='AI-modellen är inte installerad (se README).';return;}
+ k.pose=await r.json();draw();$('pose').innerHTML=poseText(k.pose,k);}
+function poseText(fr,k){
+ const tk=k.marks.takeoff!=null?k.times[0]+k.marks.takeoff:null,tw=k.marks.water!=null?k.times[0]+k.marks.water:null;
+ const air=fr.filter(f=>f.score>0.35&&(tk==null||f.t>=tk-0.001)&&(tw==null||f.t<=tw+0.001));
+ if(air.length<5)return 'AI:n såg inte hopparen tydligt nog. Markera Upphopp och Vatten och försök igen.';
+ const start=tk!=null?tk:air[0].t,rel=t=>num(t-start,2)+' s';let s='';
+ // median of three frames in a row, so one wrong frame from the model is not reported as a result
+ const med=(key,j)=>{const v=[air[j-1],air[j],air[j+1]].filter(Boolean).map(x=>x[key]).filter(v=>v!=null).sort((a,b)=>a-b);
+  return v.length>1?v[Math.floor(v.length/2)]:null;};
+ air.forEach((f,j)=>{f.hipS=med('hip',j);f.kneeS=med('knee',j);f.lineS=med('line',j);});
+ const hips=air.filter(f=>f.hipS!=null).map(f=>({...f,hip:f.hipS}));
+ if(hips.length){const tight=hips.reduce((a,b)=>b.hip<a.hip?b:a);
+  s+='Tätaste höftvinkel <b>'+Math.round(tight.hip)+'°</b> efter '+rel(tight.t);
+  const open=hips.find(f=>f.t>tight.t&&f.hip>150);
+  if(open)s+='<br>Öppnar (höft över 150°) efter <b>'+rel(open.t)+'</b> <button onclick="useOpen('+open.t+')" style="padding:6px 10px;font-size:14px">Använd som Öppning</button>';}
+ const knees=air.filter(f=>f.kneeS!=null).map(f=>({...f,knee:f.kneeS}));
+ if(knees.length){const bent=knees.reduce((a,b)=>b.knee<a.knee?b:a);s+='<br>Mest böjda knä <b>'+Math.round(bent.knee)+'°</b> efter '+rel(bent.t);}
+ const tr=air.filter(f=>f.trunk!=null); // the trunk has a head end, so it counts full turns even in tuck
+ if(tr.length>=5){let acc=0;for(let j=1;j<tr.length;j++){let d=tr[j].trunk-tr[j-1].trunk;d=((d+180)%360+360)%360-180;acc+=d;}
+  const revs=Math.abs(acc)/360,secs=tr[tr.length-1].t-tr[0].t;
+  s+='<br>Rotation (bålen) ≈ <b>'+num(revs,1)+' varv</b>'+(secs>0?', '+num(revs/secs,1)+' varv/s':'');}
+ // entry: shoulder-ankle line, or the trunk if the ankles are unsure; only frames right at the water mark
+ const entry=tw==null?[]:air.filter(f=>Math.abs(f.t-tw)<0.07&&(f.lineS!=null||f.trunk!=null));
+ if(entry.length){const e=entry.reduce((a,b)=>Math.abs(b.t-tw)<Math.abs(a.t-tw)?b:a),ang=e.lineS!=null?e.lineS:e.trunk;
+  const dev=Math.abs(((ang-90)%360+540)%360-180);
+  s+='<br>Kroppslinje vid vattnet: <b>'+Math.round(Math.min(dev,180-dev))+'°</b> från lodrätt'+(e.lineS!=null?'':' (bålen)');}
+ return s+'<br><small>AI-uppskattning från '+air.length+' bilder. Stäm av mot videon.</small>';}
+function useOpen(t){if(!R)return;R.marks.open=t-R.times[0];
+ $('mk').querySelectorAll('button').forEach(x=>x.classList.toggle('on',R.marks[x.dataset.m]!=null));showPhys();draw();}
 async function feedback(){if(!R)return;$('fb').hidden=false;$('fb').textContent='Skriver…';
  const plain=h=>h.replace(/<br>/g,'\n').replace(/<[^>]+>/g,'');
  const text='Hoppare: '+($('diver').value||'-')+'\nHopp: '+($('dive').value||'-')+'\nHöjd: '+$('board').value+' m\n'
-  +plain($('phys').innerHTML)+'\n'+($('trk').hidden?'':plain($('trk').innerHTML));
+  +plain($('phys').innerHTML)+'\n'+($('trk').hidden?'':plain($('trk').innerHTML))+'\n'+($('pose').hidden?'':plain($('pose').innerHTML));
  const r=await post('/api/feedback',{text});$('fb').textContent=r.ok?(await r.json()).text:'Ingen språkmodell konfigurerad.';}
 
 // ---- Dives found automatically in the zone ------------------------------------------------
@@ -923,6 +1078,11 @@ class Web(http.server.BaseHTTPRequestHandler):
             if parts == ["api", "stro"]:
                 img = stromotion(cam_of(q["cam"]), float(q["t0"]), float(q["t1"]), rot_param(q), max(1, int(q.get("every", 5))))
                 return self.reply(200, img, "image/jpeg") if img else self.reply(404, b"", "text/plain")
+            if parts == ["api", "pose"]:
+                if not pose_available():
+                    return self.reply(404, b"", "text/plain")
+                frames = body_pose(cam_of(q["cam"]), float(q["t0"]), float(q["t1"]), rot_param(q))
+                return self.reply(200, json.dumps(frames).encode(), "application/json")
             if parts == ["api", "track"]:
                 pts = track(cam_of(q["cam"]), float(q["t0"]), float(q["t1"]), rot_param(q))
                 return self.reply(200, json.dumps(pts).encode(), "application/json")
@@ -1183,7 +1343,7 @@ while True:
     tv = hits[main][0]
     status = {"delay": state["delay"], "review": review, "paused": paused, "behind": back, "span": span, "tv": tv,
               "layout": layout, "zone": state["zone"], "autosave": state["autosave"], "llm": bool(LLM_URL),
-              "tvrep": bool(tvr), "cams": [{"idx": c.idx, "w": c.w, "h": c.h, "rot": rot_of(c.idx)} for c in cams]}
+              "tvrep": bool(tvr), "pose": pose_available(), "cams": [{"idx": c.idx, "w": c.w, "h": c.h, "rot": rot_of(c.idx)} for c in cams]}
 
     if span < back and not review:
         text = f"Buffrar {span:.0f}/{back} s"
