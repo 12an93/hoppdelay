@@ -20,6 +20,15 @@ or pool network needed: the box runs its own Wi-Fi.
 - Compare two saved dives side by side or overlaid, aligned on the takeoff, frame by frame.
 - Save clips as MP4 named by diver, dive and height; filter, rename, delete, and save straight to
   Photos on iPhone.
+- One or two cameras (e.g. 1 m and 3 m, or side and front). TV layouts: camera 1, camera 2,
+  side by side, picture in picture.
+- Show a replay in a corner of the TV while the delayed picture keeps running.
+- Automatic dive list: draw a zone in the air in front of the board; every dive through it is listed
+  (and can be saved automatically).
+- StroMotion picture: the diver pasted in every few frames along the path, in one image.
+- Automatic analysis of a dive: path, highest point, distance out from the board, and number of
+  somersaults and turns per second.
+- Optional AI feedback written from the measurements, using any OpenAI-compatible endpoint (e.g. Ollama).
 - Own Wi-Fi hotspot, starts by itself when power is connected.
 
 ## Hardware
@@ -28,7 +37,7 @@ or pool network needed: the box runs its own Wi-Fi.
 - USB camera with MJPEG 1080p30 (tested: Jabra PanaCast 20 with Intelligent Zoom turned off in Jabra Direct).
 - **The PanaCast 20 must be connected with a USB 2 cable** (e.g. a phone charging cable). On USB 3 it
   only offers MJPEG in 4K.
-- Optional: keyboard or presenter clicker with a USB dongle.
+- Optional: a second USB camera, and a keyboard or presenter clicker with a USB dongle.
 
 ## Install (Debian 13, no desktop)
 
@@ -36,14 +45,15 @@ In the BIOS, set *Restore AC Power Loss → Power On* so the box starts when pow
 
 ```
 sudo sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=0/' /etc/default/grub && sudo update-grub && echo 'FSCKFIX=yes' | sudo tee -a /etc/default/rcS
-sudo apt install -y avahi-daemon openssl iw dnsmasq-base v4l-utils python3-evdev python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly intel-media-va-driver
+sudo apt install -y avahi-daemon openssl iw dnsmasq-base v4l-utils python3-evdev python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly intel-media-va-driver python3-opencv python3-numpy
 sudo install -m755 hoppdelay.py /usr/local/bin/hoppdelay.py && sudo install -m644 hoppdelay.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now hoppdelay
 ```
 
 If a desktop is installed: `sudo systemctl set-default multi-user.target`.
 
-The first USB camera is used. To pick another one, set `HOPPDELAY_CAM` in `hoppdelay.service`
-(list cameras with `ls /dev/v4l/by-id/`).
+Every USB camera with MJPEG up to 1080p30 is used (at most two). To choose, set
+`HOPPDELAY_CAMS=/dev/v4l/by-id/...,/dev/v4l/by-id/...` in `hoppdelay.service` (list cameras with
+`ls /dev/v4l/by-id/`). Cameras without MJPEG up to 1080p are skipped with a note in the log.
 
 Log: `sudo journalctl -u hoppdelay -n 30 --no-pager`
 
@@ -77,7 +87,8 @@ HTTPS is required for iPhone to save clips straight to Photos. The certificates 
 | → / PageDown | Forward 5 s |
 | Space / B | Pause / play |
 | Enter / Esc | Back to normal delay |
-| R | Rotate 90° |
+| R | Rotate camera 1 by 90° |
+| L | Next TV layout (two cameras) |
 
 ## Measurements
 
@@ -85,6 +96,32 @@ Mark **Takeoff** and **Water** (and optionally **Top** and **Opening**) while st
 and pick the board height. The numbers come from projectile motion of the centre of mass, assuming it
 drops about the board height from takeoff to entry. At 30 fps one frame is ±0.03 s, which is roughly
 ±0.1–0.2 m on the height. A 60 fps camera halves that.
+
+## Automatic dives
+
+Take a replay from camera 1, choose the **Zone** tool and tap two corners of a box in the air just in
+front of the board, where only the diver passes (not the board, the water or the stands). Each dive
+through the box shows up under **Dives today** with a few seconds before and after; tap **Show** to open
+it as a replay. With **Save automatically** on, each one is also saved as a clip.
+
+## Automatic analysis
+
+**Analyse path and rotation** finds the diver against the background in every frame (the camera must
+not move) and draws the path on the replay. Mark **Takeoff** and **Water** first and calibrate once
+for metres. Rotation is counted from the body axis, so it works well in straight and pike, less well in
+tuck – the page says when it is uncertain.
+
+## AI feedback (optional)
+
+Set an OpenAI-compatible chat endpoint in `hoppdelay.service`, for example Ollama on another machine:
+
+```
+Environment=HOPPDELAY_LLM_URL=http://192.168.1.10:11434/v1/chat/completions
+Environment=HOPPDELAY_LLM_MODEL=qwen3:8b
+```
+
+(`HOPPDELAY_LLM_KEY` for services that need a key.) Only the measured numbers are sent, never video.
+The box must be able to reach the endpoint, which usually means not at the pool.
 
 ## License
 
