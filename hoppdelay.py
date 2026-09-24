@@ -1,43 +1,56 @@
 #!/usr/bin/env python3
-# Delayed video playback for diving practice.
-# Records to disk (whole session), plays back delayed on HDMI, controlled from a
-# keyboard/clicker or a phone (web page on port 80).
+# Hoppdelay – delayed video replay for diving practice.
+# Records one or two USB cameras to disk (whole session), plays back delayed on HDMI, and is
+# controlled from a keyboard/clicker or a phone (web page, HTTP 80 / HTTPS 443).
 # Keys:
 #   Up / Down           delay +5 s / -5 s
 #   Left / PageUp       go back 5 s
 #   Right / PageDown    go forward 5 s
 #   Space / B           pause / play
 #   Enter / Esc         back to normal delay
-#   R                   rotate image 90 degrees
+#   R                   rotate camera 1 by 90 degrees
+#   L                   next TV layout (with two cameras)
 import bisect
 import http.server
 import json
 import os
 import pathlib
 import queue
+import re
 import select
 import shutil
 import ssl
 import subprocess
 import threading
 import time
-from urllib.parse import unquote
+import urllib.request
+from urllib.parse import parse_qs, unquote, urlsplit
 
+import cv2
 import evdev
 import gi
+import numpy as np
 
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst
 
-# Camera: HOPPDELAY_CAM if set, otherwise the first USB camera.
-CAM = os.environ.get("HOPPDELAY_CAM") or str(next(iter(sorted(pathlib.Path("/dev/v4l/by-id").glob("*-video-index0"))), "/dev/video0"))
-W, H, FPS = 1920, 1080, 30
+FPS = 30
 REC = pathlib.Path("/var/lib/hoppdelay")
-SEG_S = 60  # one recording file per minute
-MAX_DISK = shutil.disk_usage("/").total * 4 // 10  # recording may use 40 % of the disk
-STEP_S = 5
+CLIPS = REC / "clips"
+CERTS = pathlib.Path("/etc/hoppdelay")  # own CA + server cert: iPhone needs HTTPS to share files to Photos
 STATE = pathlib.Path.home() / ".hoppdelay.json"
+SEG_S = 60  # one recording file per minute
+MAX_DISK = shutil.disk_usage("/").total * 4 // 10  # recordings may use 40 % of the disk (shared by the cameras)
+MAX_CLIP_S = 120
+STEP_S = 5
 ROTATIONS = ["none", "clockwise", "rotate-180", "counterclockwise"]
+LAYOUTS = ["cam0", "cam1", "split", "pip"]
+# Automatic clips: motion in the zone starts an event; the clip gets some time before and after.
+EVENT_PRE_S, EVENT_POST_S, EVENT_GAP_S = 4.0, 2.0, 1.5
+# Optional LLM feedback: any OpenAI-compatible chat endpoint, e.g. Ollama http://host:11434/v1/chat/completions
+LLM_URL = os.environ.get("HOPPDELAY_LLM_URL", "")
+LLM_MODEL = os.environ.get("HOPPDELAY_LLM_MODEL", "qwen3:8b")
+LLM_KEY = os.environ.get("HOPPDELAY_LLM_KEY", "")
 
 E = evdev.ecodes
 KEYMAP = {  # key -> command (same commands as the web page)
@@ -46,95 +59,143 @@ KEYMAP = {  # key -> command (same commands as the web page)
     E.KEY_RIGHT: ("step", STEP_S), E.KEY_PAGEDOWN: ("step", STEP_S),
     E.KEY_SPACE: ("pause", 0), E.KEY_B: ("pause", 0),
     E.KEY_ENTER: ("live", 0), E.KEY_ESC: ("live", 0),
-    E.KEY_R: ("rotate", 0),
+    E.KEY_R: ("rotate", 0), E.KEY_L: ("layout_next", 0),
 }
-COMMANDS = {"delay_by", "step", "seek", "pause", "live", "rotate"}
-CLIPS = REC / "clips"
-CERTS = pathlib.Path("/etc/hoppdelay")  # own CA + server cert: iPhone needs HTTPS to share files to Photos
-MAX_CLIP_S = 120
+COMMANDS = {"delay_by", "step", "seek", "pause", "live", "rotate", "layout", "layout_next", "autosave"}
 
 Gst.init(None)
 DECODER = "vajpegdec" if Gst.ElementFactory.find("vajpegdec") else "jpegdec"  # Intel GPU decode if available
 ENCODER = "vah264enc" if Gst.ElementFactory.find("vah264enc") else "x264enc speed-preset=veryfast"
 
-state = {"delay": 30, "rot": "none"}
+state = {"delay": 30, "rots": {}, "layout": "cam0", "zone": None, "autosave": False}
 try:
     state.update(json.loads(STATE.read_text()))
 except (OSError, ValueError):
     pass
-
-# --- Recording: JPEG frames appended to one file per minute; index in memory ---------------
-CLIPS.mkdir(parents=True, exist_ok=True)  # saved clips are kept across restarts
-for f in CLIPS.glob("*.part"):  # unfinished saves
-    f.unlink()
-for f in REC.glob("*.mjpg"):  # the index lives in memory, so old files are unusable
-    f.unlink()
-times, refs = [], []  # capture time (monotonic s), (segment, offset, length); oldest first
-segs = {}  # segment number -> bytes
-disk = 0
-seg_no, seg_file, seg_start = -1, None, 0.0
-lock = threading.Lock()
+if "rot" in state:  # older versions had one rotation
+    state["rots"].setdefault("0", state.pop("rot"))
+state_lock = threading.Lock()
 
 
-def seg_path(n):
-    return REC / f"{n:06d}.mjpg"
+def save_state():
+    with state_lock:
+        STATE.write_text(json.dumps(state))
 
 
-def on_frame(sink):
-    global disk, seg_no, seg_file, seg_start
-    buf = sink.emit("pull-sample").get_buffer()
-    data = buf.extract_dup(0, buf.get_size())
-    now = time.monotonic()
-    if seg_file is None or now - seg_start >= SEG_S:
-        if seg_file:
-            seg_file.close()
-        seg_no, seg_start = seg_no + 1, now
-        seg_file = open(seg_path(seg_no), "wb", buffering=0)
-        with lock:
-            segs[seg_no] = 0
-    offset = seg_file.tell()
-    seg_file.write(data)
-    with lock:
-        times.append(now)
-        refs.append((seg_no, offset, len(data)))
-        segs[seg_no] += len(data)
-        disk += len(data)
-        while disk > MAX_DISK and len(segs) > 1:  # drop the oldest minute
-            old = min(segs)
-            disk -= segs.pop(old)
-            n = bisect.bisect_left(refs, (old + 1,))
-            del times[:n], refs[:n]
-            seg_path(old).unlink()
-    return Gst.FlowReturn.OK
+def rot_of(i):
+    return state["rots"].get(str(i), "none")
 
 
-def read_frame(ref):
-    n, offset, length = ref
-    with open(seg_path(n), "rb") as f:
-        f.seek(offset)
-        return f.read(length)
+# --- Cameras ---------------------------------------------------------------------------------
+def best_mjpeg_size(dev):
+    # Largest MJPEG size up to 1080p that the camera offers at 30 fps, or None.
+    out = subprocess.run(["v4l2-ctl", "-d", dev, "--list-formats-ext"], capture_output=True, text=True).stdout
+    sizes, fmt, size = [], None, None
+    for line in out.splitlines():
+        if m := re.search(r"\[\d+\]: '(\w+)'", line):
+            fmt = m.group(1)
+        elif m := re.search(r"Size: Discrete (\d+)x(\d+)", line):
+            size = (int(m.group(1)), int(m.group(2)))
+        elif fmt == "MJPG" and size and "(30.000 fps)" in line and size[0] <= 1920 and size[1] <= 1080:
+            sizes.append(size)
+    return max(sizes, key=lambda s: s[0] * s[1]) if sizes else None
 
 
-def frames_between(t0, t1):
-    with lock:
-        i, j = bisect.bisect_left(times, t0), bisect.bisect_right(times, t1)
-        return times[i:j], refs[i:j]
+def find_cameras():
+    # HOPPDELAY_CAMS (comma separated) or HOPPDELAY_CAM if set, otherwise every USB camera; at most two.
+    env = os.environ.get("HOPPDELAY_CAMS") or os.environ.get("HOPPDELAY_CAM")
+    devs = env.split(",") if env else [str(p) for p in sorted(pathlib.Path("/dev/v4l/by-id").glob("*-video-index0"))]
+    found = []
+    for dev in devs:
+        size = best_mjpeg_size(dev.strip())
+        if size:
+            found.append((dev.strip(), *size))
+        else:
+            print(f"Skipping {dev}: no MJPEG up to 1080p30 (PanaCast 20: use a USB 2 cable)", flush=True)
+    return found[:2]
 
 
-def frame_at(t):
-    with lock:
-        if not refs:
-            return None
-        ref = refs[max(bisect.bisect_right(times, t) - 1, 0)]
-    return read_frame(ref)
+class Camera:
+    # One USB camera: JPEG frames appended to one file per minute, index in memory.
+    def __init__(self, idx, dev, w, h, max_disk):
+        self.idx, self.dev, self.w, self.h, self.max_disk = idx, dev, w, h, max_disk
+        self.dir = REC / f"cam{idx}"
+        self.dir.mkdir(parents=True, exist_ok=True)
+        for f in self.dir.glob("*.mjpg"):  # the index lives in memory, so old files are unusable
+            f.unlink()
+        self.times, self.refs, self.segs, self.disk = [], [], {}, 0  # refs: (segment, offset, length)
+        self.seg_no, self.seg_file, self.seg_start = -1, None, 0.0
+        self.lock = threading.Lock()
+        self.listeners = []  # called with (time, jpeg) for every frame, e.g. the motion detector
+        self.pipe = Gst.parse_launch(
+            f"v4l2src device={dev} ! image/jpeg,width={w},height={h},framerate={FPS}/1 ! "
+            "appsink name=sink emit-signals=true max-buffers=2 drop=true sync=false")
+        self.pipe.get_by_name("sink").connect("new-sample", self.on_frame)
+
+    def start(self):
+        self.pipe.set_state(Gst.State.PLAYING)
+
+    def seg_path(self, n):
+        return self.dir / f"{n:06d}.mjpg"
+
+    def on_frame(self, sink):
+        buf = sink.emit("pull-sample").get_buffer()
+        data = buf.extract_dup(0, buf.get_size())
+        now = time.monotonic()
+        if self.seg_file is None or now - self.seg_start >= SEG_S:
+            if self.seg_file:
+                self.seg_file.close()
+            self.seg_no, self.seg_start = self.seg_no + 1, now
+            self.seg_file = open(self.seg_path(self.seg_no), "wb", buffering=0)
+            with self.lock:
+                self.segs[self.seg_no] = 0
+        offset = self.seg_file.tell()
+        self.seg_file.write(data)
+        with self.lock:
+            self.times.append(now)
+            self.refs.append((self.seg_no, offset, len(data)))
+            self.segs[self.seg_no] += len(data)
+            self.disk += len(data)
+            while self.disk > self.max_disk and len(self.segs) > 1:  # drop the oldest minute
+                old = min(self.segs)
+                self.disk -= self.segs.pop(old)
+                n = bisect.bisect_left(self.refs, (old + 1,))
+                del self.times[:n], self.refs[:n]
+                self.seg_path(old).unlink()
+        for listener in self.listeners:
+            listener(now, data)
+        return Gst.FlowReturn.OK
+
+    def read(self, ref):
+        n, offset, length = ref
+        with open(self.seg_path(n), "rb") as f:
+            f.seek(offset)
+            return f.read(length)
+
+    def between(self, t0, t1):
+        with self.lock:
+            i, j = bisect.bisect_left(self.times, t0), bisect.bisect_right(self.times, t1)
+            return self.times[i:j], self.refs[i:j]
+
+    def at(self, t):
+        # (capture time, ref) of the newest frame at or before t, or the oldest frame; None if empty.
+        with self.lock:
+            if not self.refs:
+                return None
+            i = max(bisect.bisect_right(self.times, t) - 1, 0)
+            return self.times[i], self.refs[i]
+
+    def span(self, now):
+        with self.lock:
+            return (now - self.times[0] if self.times else 0.0), (self.times[-1] if self.times else None)
 
 
-def save_clip(t0, t1, rot, name):
+def save_clip(cam, t0, t1, rot, name):
     # Re-encode the JPEG frames to H.264 MP4 (plays on iPhone), upright according to `rot`.
-    ts, rs = frames_between(t0, t1)
+    ts, rs = cam.between(t0, t1)
     tmp = CLIPS / (name + ".part")
     p = Gst.parse_launch(
-        f"appsrc name=src format=time block=true caps=image/jpeg,width={W},height={H},framerate={FPS}/1 ! "
+        f"appsrc name=src format=time block=true caps=image/jpeg,width={cam.w},height={cam.h},framerate={FPS}/1 ! "
         f"jpegparse ! {DECODER} ! videoflip method={rot} ! videoconvert ! video/x-raw,format=NV12 ! "
         f"{ENCODER} ! h264parse ! mp4mux ! filesink name=sink"
     )
@@ -143,7 +204,7 @@ def save_clip(t0, t1, rot, name):
     p.set_state(Gst.State.PLAYING)
     for t, ref in zip(ts, rs):
         try:
-            buf = Gst.Buffer.new_wrapped(read_frame(ref))
+            buf = Gst.Buffer.new_wrapped(cam.read(ref))
         except FileNotFoundError:
             continue
         buf.pts = int((t - ts[0]) * Gst.SECOND)
@@ -159,25 +220,200 @@ def save_clip(t0, t1, rot, name):
         tmp.unlink(missing_ok=True)
 
 
+def new_clip(cam, t0, t1, rot, base, meta):
+    # Pick a unique name, write the metadata and encode in the background. Returns the clip name.
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(time.time() - (time.monotonic() - t0)))
+    base = f"{base} {stamp}"
+    name, n = base + ".mp4", 2
+    while (CLIPS / name).exists() or (CLIPS / (name + ".part")).exists():  # same second saved twice
+        name, n = f"{base}-{n}.mp4", n + 1
+    meta_file(CLIPS / name).write_text(json.dumps(meta))
+    (CLIPS / (name + ".part")).touch()  # shows up as "saving" right away
+    threading.Thread(target=save_clip, args=(cam, t0, t1, rot, name), daemon=True).start()
+    return name
+
+
+# --- Image analysis (OpenCV) -------------------------------------------------------------------
+CV_ROT = {"clockwise": cv2.ROTATE_90_CLOCKWISE, "rotate-180": cv2.ROTATE_180,
+          "counterclockwise": cv2.ROTATE_90_COUNTERCLOCKWISE}
+REDUCE = {1: cv2.IMREAD_COLOR, 2: cv2.IMREAD_REDUCED_COLOR_2, 4: cv2.IMREAD_REDUCED_COLOR_4, 8: cv2.IMREAD_REDUCED_COLOR_8}
+
+
+def decode(jpeg, factor=1, rot="none"):
+    # JPEG -> BGR image, decoded at 1/factor size (fast), rotated to how it is shown.
+    img = cv2.imdecode(np.frombuffer(jpeg, np.uint8), REDUCE[factor])
+    return cv2.rotate(img, CV_ROT[rot]) if rot in CV_ROT else img
+
+
+def view_to_raw(x, y, rot):
+    # Normalised point on the rotated picture -> normalised point on the camera picture.
+    return {"none": (x, y), "clockwise": (y, 1 - x), "rotate-180": (1 - x, 1 - y), "counterclockwise": (1 - y, x)}[rot]
+
+
+def foreground(cam, t0, t1, rot, factor):
+    # Everything that moves between t0 and t1 compared to the background (median of the clip),
+    # ignoring spots that move most of the time (water, spectators). Yields (t, image, mask).
+    ts, refs = cam.between(t0, t1)
+    if len(refs) < 3:
+        return
+    sample = [decode(cam.read(r), factor, rot) for r in refs[:: max(1, len(refs) // 25)]]
+    bg = np.median(np.stack(sample), axis=0).astype(np.uint8)
+    gbg = cv2.GaussianBlur(cv2.cvtColor(bg, cv2.COLOR_BGR2GRAY), (5, 5), 0)
+    diff = lambda img: cv2.absdiff(cv2.GaussianBlur(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), (5, 5), 0), gbg) > 30
+    busy = np.mean([diff(s) for s in sample], axis=0) > 0.35
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    yield None, bg, None
+    for t, ref in zip(ts, refs):
+        img = decode(cam.read(ref), factor, rot)
+        m = (diff(img) & ~busy).astype(np.uint8)
+        m = cv2.morphologyEx(cv2.morphologyEx(m, cv2.MORPH_OPEN, kernel), cv2.MORPH_CLOSE, kernel, iterations=2)
+        yield t, img, m
+
+
+def largest_blob(mask, min_area):
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
+    if n < 2:
+        return None
+    k = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    return (labels == k).astype(np.uint8) if stats[k, cv2.CC_STAT_AREA] >= min_area else None
+
+
+def stromotion(cam, t0, t1, rot, every):
+    # One picture with the diver pasted in every `every` frames along the path (like Dartfish StroMotion).
+    frames = foreground(cam, t0, t1, rot, max(1, analysis_factor(cam) // 2))  # a bit sharper for the picture
+    head = next(frames, None)
+    if head is None:
+        return None
+    out = head[1].copy()
+    min_area = out.shape[0] * out.shape[1] // 2000
+    for i, (t, img, m) in enumerate(frames):
+        if i % every:
+            continue
+        blob = largest_blob(m, min_area)
+        if blob is not None:
+            blob = cv2.dilate(blob, np.ones((5, 5), np.uint8)).astype(bool)
+            out[blob] = img[blob]
+    return cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 90])[1].tobytes()
+
+
+def analysis_factor(cam):
+    # Decode at about 480 px width: fast, and the diver is still big enough to keep her shape.
+    factor = 1
+    while factor < 8 and cam.w / (factor * 2) >= 480:
+        factor *= 2
+    return factor
+
+
+def track(cam, t0, t1, rot):
+    # Centre and body axis of the diver in every frame, in pixels of the full-size rotated picture.
+    factor, points = analysis_factor(cam), []
+    frames = foreground(cam, t0, t1, rot, factor)
+    head = next(frames, None)
+    if head is None:
+        return points
+    min_area = head[1].shape[0] * head[1].shape[1] // 2000
+    for t, img, m in frames:
+        blob = largest_blob(m, min_area)
+        if blob is None:
+            continue
+        mo = cv2.moments(blob, binaryImage=True)
+        cx, cy = mo["m10"] / mo["m00"], mo["m01"] / mo["m00"]
+        a, b, c = mo["mu20"] / mo["m00"], mo["mu11"] / mo["m00"], mo["mu02"] / mo["m00"]
+        root = np.sqrt(((a - c) / 2) ** 2 + b * b)
+        l1, l2 = (a + c) / 2 + root, (a + c) / 2 - root  # spread along the body axis and across it
+        points.append({"t": t, "x": cx * factor, "y": cy * factor, "angle": float(np.degrees(0.5 * np.arctan2(2 * b, a - c))),
+                       "elong": float(np.sqrt(l1 / l2)) if l2 > 1e-6 else 99.0})
+    return points
+
+
+class Detector(threading.Thread):
+    # Motion in the zone (camera 1) = a dive. Frames arrive from the capture thread and are dropped if busy.
+    def __init__(self, cam):
+        super().__init__(daemon=True)
+        self.cam, self.q, self.events, self.lock = cam, queue.Queue(maxsize=8), [], threading.Lock()
+        cam.listeners.append(self.feed)
+
+    def feed(self, t, jpeg):
+        try:
+            self.q.put_nowait((t, jpeg))
+        except queue.Full:
+            pass
+
+    def run(self):
+        bg, key, start, last = None, None, None, 0.0
+        while True:
+            t, jpeg = self.q.get()
+            zone = state.get("zone")
+            if not zone:
+                bg, start = None, None
+                continue
+            g = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_REDUCED_GRAYSCALE_8)
+            h, w = g.shape
+            x0, y0, x1, y1 = int(zone[0] * w), int(zone[1] * h), int(zone[2] * w), int(zone[3] * h)
+            if x1 - x0 < 4 or y1 - y0 < 4:
+                continue
+            g = cv2.GaussianBlur(g[y0:y1, x0:x1], (5, 5), 0).astype(np.float32)
+            if bg is None or key != zone:
+                bg, key, start = g, zone, None
+                continue
+            moving = np.mean(np.abs(g - bg) > 25) > 0.02
+            # Always follow the background slowly: a passing diver covers each spot only for a few
+            # frames, while someone who was in the zone at start fades out within a second or two.
+            cv2.accumulateWeighted(g, bg, 0.05)
+            if moving:
+                start, last = (start if start is not None else t), t
+                if t - start > 10:  # someone standing in the zone, not a dive
+                    start = None
+            elif start is not None and t - last > EVENT_GAP_S:
+                if last - start >= 0.2:
+                    self.add(start - EVENT_PRE_S, last + EVENT_POST_S)
+                start = None
+
+    def add(self, t0, t1):
+        wall = time.strftime("%H:%M:%S", time.localtime(time.time() - (time.monotonic() - t0 - EVENT_PRE_S)))
+        with self.lock:
+            self.events.append({"t0": t0, "t1": t1, "wall": wall})
+            del self.events[:-200]
+        if state.get("autosave"):
+            def later():  # wait until the end of the clip has been recorded
+                time.sleep(max(0.0, t1 + 0.3 - time.monotonic()))
+                new_clip(self.cam, t0, t1, rot_of(self.cam.idx), "Auto", {"board": 3.0, "marks": {}, "cam": self.cam.idx})
+            threading.Thread(target=later, daemon=True).start()
+
+
+def llm_feedback(text):
+    body = {"model": LLM_MODEL, "temperature": 0.3, "messages": [
+        {"role": "system", "content": (
+            "Du är assistent åt en simhoppstränare. Du får mätvärden från ett videoanalysverktyg för ett hopp. "
+            "Skriv 2–4 korta punkter på svenska: vad siffrorna visar och vad tränaren kan titta efter. "
+            "Använd bara siffrorna du får, hitta inte på tekniska fel du inte kan se, och påminn kort om "
+            "mätosäkerheten om den är stor.")},
+        {"role": "user", "content": text}]}
+    headers = {"Content-Type": "application/json", **({"Authorization": f"Bearer {LLM_KEY}"} if LLM_KEY else {})}
+    req = urllib.request.Request(LLM_URL, data=json.dumps(body).encode(), headers=headers)
+    reply = json.load(urllib.request.urlopen(req, timeout=120))["choices"][0]["message"]["content"]
+    return re.sub(r"<think>.*?</think>", "", reply, flags=re.S).strip()  # reasoning models
+
+
 # --- Display ---------------------------------------------------------------------------------
 def screen_size():
     # Largest progressive mode up to 1080p on the first connected screen. Not the "preferred" mode:
     # AV receivers often report 640x480 as preferred. Re-checked so a different TV can be plugged in.
-    for status in sorted(pathlib.Path("/sys/class/drm").glob("card*-*/status")):
-        if status.read_text().strip() == "connected":
-            modes = [tuple(map(int, m.split("x"))) for m in (status.parent / "modes").read_text().split() if not m.endswith("i")]
+    for status_file in sorted(pathlib.Path("/sys/class/drm").glob("card*-*/status")):
+        if status_file.read_text().strip() == "connected":
+            modes = [tuple(map(int, m.split("x"))) for m in (status_file.parent / "modes").read_text().split() if not m.endswith("i")]
             modes = [m for m in modes if m[0] <= 1920 and m[1] <= 1080]
-            conn_file = status.parent / "connector_id"  # tell kmssink which output to use
+            conn_file = status_file.parent / "connector_id"  # tell kmssink which output to use
             conn = int(conn_file.read_text()) if conn_file.exists() else -1
             if modes:
                 return (*max(modes, key=lambda m: m[0] * m[1]), conn)
     return 1920, 1080, -1
 
 
-def display(rot, sw, sh, conn):
-    # Scale to the screen, keeping aspect ratio (black borders), in both landscape and portrait.
+def display_jpeg(cam, rot, sw, sh, conn):
+    # One camera full screen: JPEG decoded by the GPU, scaled with black borders, text on top.
     p = Gst.parse_launch(
-        f"appsrc name=src is-live=true max-buffers=1 leaky-type=downstream do-timestamp=true format=time caps=image/jpeg,width={W},height={H},framerate={FPS}/1 ! "
+        f"appsrc name=src is-live=true max-buffers=1 leaky-type=downstream do-timestamp=true format=time caps=image/jpeg,width={cam.w},height={cam.h},framerate={FPS}/1 ! "
         f"jpegparse ! {DECODER} ! videoflip method={rot} ! videoconvert ! "
         f"videoscale add-borders=true ! video/x-raw,width={sw},height={sh},pixel-aspect-ratio=1/1 ! "
         'textoverlay name=txt valignment=top halignment=left font-desc="Sans 20" ! '
@@ -185,6 +421,67 @@ def display(rot, sw, sh, conn):
     )
     p.set_state(Gst.State.PLAYING)
     return p, p.get_by_name("src"), p.get_by_name("txt")
+
+
+def display_raw(sw, sh, conn):
+    # Picture composed in Python (split screen, picture in picture, TV replay).
+    p = Gst.parse_launch(
+        f"appsrc name=src is-live=true max-buffers=1 leaky-type=downstream do-timestamp=true format=time "
+        f"caps=video/x-raw,format=BGR,width={sw},height={sh},framerate={FPS}/1 ! "
+        f"videoconvert ! kmssink sync=false force-modesetting=true connector-id={conn}"
+    )
+    p.set_state(Gst.State.PLAYING)
+    return p, p.get_by_name("src"), None
+
+
+def fit(img, bw, bh):
+    h, w = img.shape[:2]
+    s = min(bw / w, bh / h)
+    return cv2.resize(img, (max(1, int(w * s)), max(1, int(h * s))), interpolation=cv2.INTER_AREA)
+
+
+def paste(canvas, img, x, y, bw, bh, border=False):
+    img = fit(img, bw, bh)
+    h, w = img.shape[:2]
+    x, y = x + (bw - w) // 2, y + (bh - h) // 2
+    canvas[y:y + h, x:x + w] = img
+    if border:
+        cv2.rectangle(canvas, (x - 2, y - 2), (x + w + 1, y + h + 1), (255, 255, 255), 2)
+
+
+def put_text(canvas, text, x, y, size):
+    for color, thick in (((0, 0, 0), 5), ((255, 255, 255), 2)):
+        cv2.putText(canvas, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, size, color, thick, cv2.LINE_AA)
+
+
+def decode_for(cam, jpeg, rot, box_w):
+    # Decode no bigger than needed for a box `box_w` pixels wide.
+    width = cam.h if rot in ("clockwise", "counterclockwise") else cam.w
+    factor = 1
+    while factor < 8 and width / (factor * 2) >= box_w:
+        factor *= 2
+    return decode(jpeg, factor, rot)
+
+
+def compose(sw, sh, layout, shown, tv_frame, text):
+    # shown: {camera index: (cam, jpeg)}; tv_frame: (cam, jpeg) of the TV replay or None.
+    canvas = np.zeros((sh, sw, 3), np.uint8)
+    if layout == "split" and len(shown) == 2:
+        for k, (i, (cam, jpeg)) in enumerate(sorted(shown.items())):
+            paste(canvas, decode_for(cam, jpeg, rot_of(i), sw // 2), k * sw // 2, 0, sw // 2, sh)
+    else:
+        main = 1 if layout == "cam1" and 1 in shown else 0
+        cam, jpeg = shown[main]
+        paste(canvas, decode_for(cam, jpeg, rot_of(main), sw), 0, 0, sw, sh)
+        if layout == "pip" and 1 in shown:
+            cam, jpeg = shown[1]
+            paste(canvas, decode_for(cam, jpeg, rot_of(1), sw // 3), sw * 2 // 3 - 16, sh * 2 // 3 - 16, sw // 3, sh // 3, True)
+    if tv_frame:
+        cam, jpeg = tv_frame
+        paste(canvas, decode_for(cam, jpeg, rot_of(cam.idx), sw // 3), 16, sh * 2 // 3 - 16, sw // 3, sh // 3, True)
+        put_text(canvas, "Repris", 24, sh * 2 // 3, sh / 1000)
+    put_text(canvas, text, 16, int(sh / 22), sh / 1200)
+    return canvas
 
 
 def scan(kbds):
@@ -203,10 +500,31 @@ def mmss(s):
     return f"{int(s) // 60}:{int(s) % 60:02d}"
 
 
-# --- Web page for the phone -------------------------------------------------------------------
-cmds = queue.Queue()  # (command, value) from keyboard and web, applied in the main loop
-status = {}  # snapshot for the web page, replaced every loop
+# --- Saved clips -----------------------------------------------------------------------------
+def clean_name(s):
+    # Letters (incl. åäö), digits, space, - _ . ; always ends in .mp4
+    s = "".join(ch for ch in s if ch.isalnum() or ch in " -_.").strip(" .").removesuffix(".mp4").strip(" .")[:80]
+    return s + ".mp4" if s else ""
 
+
+def clip_file(name):
+    # A finished clip in CLIPS, or None. Rejects paths and anything else.
+    f = CLIPS / name
+    return f if name == clean_name(name) and f.is_file() else None
+
+
+def meta_file(clip):
+    # Marks, board height and camera saved next to the clip, used for measurements and comparisons.
+    return clip.with_name(clip.name + ".json")
+
+
+def clean_meta(m):
+    marks = {k: float(v) for k, v in (m.get("marks") or {}).items()
+             if k in ("takeoff", "apex", "open", "water") and isinstance(v, (int, float))}
+    return {"board": float(m.get("board", 3)), "marks": marks}
+
+
+# --- Web page for the phone -------------------------------------------------------------------
 PAGE = r"""<!doctype html><html lang="sv"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes"><title>Hoppdelay</title>
@@ -223,8 +541,9 @@ button:active{background:#444}.big{background:#1f6feb;width:100%}.on{background:
 input[type=range]{width:100%;height:40px}label{color:#999;font-size:14px}
 #d{text-align:center;font-size:24px;align-self:center}
 canvas{width:100%;height:auto;display:block;background:#000;border-radius:8px}
-#phys{background:#1b1b1b;border-radius:10px;padding:10px 12px;font-size:15px;line-height:1.5}
-#phys small{color:#888}
+.box,#phys{background:#1b1b1b;border-radius:10px;padding:10px 12px;font-size:15px;line-height:1.5}
+#phys small,.box small,.note{color:#888;font-size:14px}
+.ev{display:flex;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid #222}.ev span{flex:1}.ev button{padding:10px 16px;font-size:16px}
 a{color:#58a6ff}#tls{background:#1c2a3a;border-radius:12px;padding:12px 14px;margin-bottom:12px;font-size:15px}#tls ol{margin:6px 0 0;padding-left:20px}
 .clip{display:flex;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid #222}
 .clip a{flex:1;word-break:break-all}.clip span{color:#999;font-size:14px}.clip button{padding:10px 14px;font-size:18px}
@@ -242,9 +561,13 @@ a{color:#58a6ff}#tls{background:#1c2a3a;border-radius:12px;padding:12px 14px;mar
 <button class="big" onclick="c('live')">Tillbaka till delay</button>
 <label>Delay</label>
 <div class="row"><button onclick="c('delay_by/-5')">−5</button><div id="d"></div><button onclick="c('delay_by/5')">+5</button></div>
-<div class="row"><button onclick="c('rotate')">Rotera ⟳</button></div>
+<div class="row" id="rots"></div>
+<div id="multi" hidden><label>TV-layout</label>
+<div class="row tools" id="lay"><button data-l="0">Kamera 1</button><button data-l="1">Kamera 2</button>
+<button data-l="2">Sida vid sida</button><button data-l="3">Bild i bild</button></div></div>
 
 <h2>Repris</h2>
+<div class="row" id="rcamrow" hidden><select id="rcam"></select></div>
 <div class="row"><select id="len"><option value="4">4 s</option><option value="7" selected>7 s</option>
 <option value="10">10 s</option><option value="15">15 s</option></select>
 <button onclick="grab()" style="flex:2">Ta repris av TV-bilden</button></div>
@@ -261,10 +584,25 @@ a{color:#58a6ff}#tls{background:#1c2a3a;border-radius:12px;padding:12px 14px;mar
 <option value="1">1 m</option><option value="3" selected>3 m</option><option value="5">5 m</option>
 <option value="7.5">7,5 m</option><option value="10">10 m</option></select></div>
 <div id="phys"></div>
+<h3>Visa på TV</h3>
+<div class="row"><button onclick="tvShow()">Visa reprisen i TV-hörnet</button><button onclick="tvHide()" id="tvoff">Stäng</button></div>
+<h3>Analys</h3>
+<div class="row"><select id="every"><option value="3">Var 3:e bild</option><option value="5" selected>Var 5:e bild</option>
+<option value="8">Var 8:e bild</option></select><button onclick="stro()">StroMotion</button></div>
+<img id="stroimg" hidden style="width:100%;border-radius:8px"><div id="strotip" class="note" hidden></div>
+<button onclick="analyse()" style="width:100%">Analysera bana och rotation</button>
+<div id="trk" class="box" hidden></div>
+<button id="fbb" onclick="feedback()" hidden style="width:100%;margin-top:8px">Skriv feedback (AI)</button>
+<div id="fb" class="box" hidden></div>
 <h3>Spara</h3>
 <div class="row"><input type="text" id="diver" placeholder="Hoppare"><input type="text" id="dive" placeholder="Hopp, t.ex. 5231D"></div>
 <button class="big" onclick="save()">Spara klipp</button>
 </div>
+
+<h2>Hopp idag</h2>
+<div id="zinfo" class="note"></div>
+<div class="row"><button id="asb" onclick="c('autosave/'+(S.autosave?0:1))">Spara automatiskt: av</button><button onclick="zoneOff()">Ta bort zon</button></div>
+<div id="ev"></div>
 
 <h2>Jämför två klipp</h2>
 <div class="row"><select id="ca"></select><select id="cb"></select></div>
@@ -297,7 +635,16 @@ function u(){fetch('/api/state').then(r=>r.json()).then(s=>{S=s;
  $('h').textContent=s.review?(s.paused?'Paus  ':'')+'−'+f(s.behind):'Delay '+s.delay+' s';
  $('sub').textContent='Inspelat '+f(s.span)+(s.review?' · tryck "Tillbaka" för delay':'');
  $('d').textContent=s.delay+' s';$('p').textContent=s.paused?'▶':'⏸';
- $('t').min=-s.span;if(!drag)$('t').value=-s.behind;})}
+ $('t').min=-s.span;if(!drag)$('t').value=-s.behind;
+ const two=s.cams.length>1;$('multi').hidden=!two;$('rcamrow').hidden=!two;
+ $('lay').querySelectorAll('button').forEach(b=>b.classList.toggle('on',['cam0','cam1','split','pip'][+b.dataset.l]===s.layout));
+ const rh=two?s.cams.map(k=>'<button onclick="c(\'rotate/'+k.idx+'\')">Rotera '+(k.idx+1)+' ⟳</button>').join(''):'<button onclick="c(\'rotate/0\')">Rotera ⟳</button>';
+ if($('rots').innerHTML!==rh)$('rots').innerHTML=rh;
+ if($('rcam').options.length!==s.cams.length)$('rcam').innerHTML=s.cams.map(k=>'<option value="'+k.idx+'">Kamera '+(k.idx+1)+'</option>').join('');
+ $('asb').textContent='Spara automatiskt: '+(s.autosave?'på':'av');$('asb').classList.toggle('on',s.autosave);
+ $('tvoff').classList.toggle('on',s.tvrep);$('fbb').hidden=!s.llm;
+ $('zinfo').textContent=s.zone?'Zonen är aktiv: varje hopp genom den hamnar i listan.':'Rita en zon: ta en repris från kamera 1, välj Zon och tryck två hörn i luften framför svikten, där bara hopparen passerar.';})}
+$('lay').onclick=e=>{const b=e.target.closest('button');if(b)c('layout/'+b.dataset.l);};
 setInterval(u,500);u();
 
 // ---- Physics from marked frames ----------------------------------------------------------
@@ -319,9 +666,9 @@ function physText(m,H){const r=phys(m,H);
 // ---- Drawing tools (line, angle, calibration) -------------------------------------------
 let SCALE=parseFloat(store('hd_scale'))||null; // metres per pixel, shared: the camera does not move
 const dist=(a,b)=>Math.hypot(a[0]-b[0],a[1]-b[1]);
-function annot(cv,redraw,bar){
+function annot(cv,redraw,bar,extra){
  const A={tool:null,pts:[],items:[]};
- bar.innerHTML=[['line','Linje'],['angle','Vinkel'],['cal','Kalibrera'],['clear','Rensa']]
+ bar.innerHTML=[['line','Linje'],['angle','Vinkel'],['cal','Kalibrera'],...(extra?[['zone','Zon']]:[]),['clear','Rensa']]
   .map(([k,l])=>'<button data-t="'+k+'">'+l+'</button>').join('');
  bar.onclick=e=>{const b=e.target.closest('button');if(!b)return;const k=b.dataset.t;
   if(k==='clear'){A.items=[];A.pts=[];A.tool=null;}else{A.tool=A.tool===k?null:k;A.pts=[];}
@@ -329,7 +676,9 @@ function annot(cv,redraw,bar){
  cv.addEventListener('click',e=>{if(!A.tool)return;const r=cv.getBoundingClientRect();
   A.pts.push([(e.clientX-r.left)*cv.width/r.width,(e.clientY-r.top)*cv.height/r.height]);
   if(A.pts.length===(A.tool==='angle'?3:2)){
-   if(A.tool==='cal'){const m=parseFloat((prompt('Hur lång är linjen i meter? (t.ex. svikthöjden)','3')||'').replace(',','.'));
+   if(A.tool==='zone'){extra(A.pts[0][0]/cv.width,A.pts[0][1]/cv.height,A.pts[1][0]/cv.width,A.pts[1][1]/cv.height);
+    A.tool=null;bar.querySelectorAll('button').forEach(x=>x.classList.remove('on'));}
+   else if(A.tool==='cal'){const m=parseFloat((prompt('Hur lång är linjen i meter? (t.ex. svikthöjden)','3')||'').replace(',','.'));
     if(m>0){SCALE=m/dist(A.pts[0],A.pts[1]);store('hd_scale',SCALE);}}
    else A.items.push({t:A.tool,p:A.pts});
    A.pts=[];}
@@ -347,19 +696,25 @@ function annot(cv,redraw,bar){
  return A;}
 
 // ---- Replay on the phone: frames fetched as JPEG blobs, decoded only around the current frame
-const A1=annot($('cv'),()=>draw(),$('tb1'));
+const A1=annot($('cv'),()=>draw(),$('tb1'),(x0,y0,x1,y1)=>{
+ if(R.cam!==0){alert('Zonen ritas på kamera 1');return;}
+ fetch('/api/zone',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({x0,y0,x1,y1,rot:R.rot})}).then(u);});
+function zoneOff(){fetch('/api/zone',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).then(u);}
+const rawToView=(x,y,rot)=>({none:[x,y],clockwise:[1-y,x],'rotate-180':[1-x,1-y],counterclockwise:[y,1-x]}[rot]);
 $('board').value=store('hd_board')||'3';
 $('board').onchange=()=>{store('hd_board',$('board').value);showPhys();};
 function showPhys(){if(R)$('phys').innerHTML=physText(R.marks,+$('board').value);}
-async function grab(){
- const r=await(await fetch('/api/range/'+(S.tv-$('len').value)+'/'+S.tv)).json();
+function grab(){loadReplay(+$('rcam').value||0,S.tv-$('len').value,S.tv);}
+async function loadReplay(cam,t0,t1){
+ const r=await(await fetch('/api/range/'+cam+'/'+t0+'/'+t1)).json();
  if(!r.times.length){$('rp').hidden=false;$('info').textContent='Inget inspelat i det intervallet ännu';return;}
- const k={times:r.times,blobs:[],bm:new Map(),rot:S.rot,i:0,playing:false,speed:1,pos:0,marks:{}};
+ const k={cam,times:r.times,blobs:[],bm:new Map(),rot:S.cams[cam].rot,i:0,playing:false,speed:1,pos:0,marks:{},track:null};
+ ['stroimg','strotip','trk','fb'].forEach(id=>$(id).hidden=true);
  R=k;$('rp').hidden=false;$('rs').max=k.times.length-1;setSpeed(1);$('pl').textContent='▶︎';showPhys();
  A1.items=[];A1.pts=[];$('mk').querySelectorAll('button').forEach(x=>x.classList.remove('on')); // new dive: fresh marks and drawings
  let next=0,done=0;
  const worker=async()=>{while(next<k.times.length&&R===k){const n=next++;
-  k.blobs[n]=await(await fetch('/frame/'+k.times[n])).blob();done++;
+  k.blobs[n]=await(await fetch('/frame/'+cam+'/'+k.times[n])).blob();done++;
   if(n===0)draw();if(R===k&&!k.playing)$('info').textContent='Laddar '+done+'/'+k.times.length;}};
  await Promise.all([1,2,3,4,5,6].map(worker));if(R===k)draw();}
 const rel=n=>R.times[n]-R.times[0];
@@ -370,7 +725,18 @@ async function draw(){const k=R,n=k&&k.i;if(!k||!k.blobs[n])return;
  const cv=$('cv'),q=k.rot==='clockwise'||k.rot==='counterclockwise',w=q?bm.height:bm.width,hh=q?bm.width:bm.height;
  if(cv.width!==w||cv.height!==hh){cv.width=w;cv.height=hh;}
  const x=cv.getContext('2d');x.save();x.translate(w/2,hh/2);x.rotate(ROT[k.rot]);
- x.drawImage(bm,-bm.width/2,-bm.height/2);x.restore();A1.paint(x);
+ x.drawImage(bm,-bm.width/2,-bm.height/2);x.restore();
+ if(k.cam===0&&S.zone){const a=rawToView(S.zone[0],S.zone[1],k.rot),b=rawToView(S.zone[2],S.zone[3],k.rot);
+  x.save();x.strokeStyle='#3fb950';x.lineWidth=Math.max(2,w/400);x.setLineDash([12,8]);
+  x.strokeRect(Math.min(a[0],b[0])*w,Math.min(a[1],b[1])*hh,Math.abs(a[0]-b[0])*w,Math.abs(a[1]-b[1])*hh);x.restore();}
+ if(k.track&&k.track.length){const tr=k.track,lw=Math.max(2,w/350),now=k.times[n];x.save();x.strokeStyle='#3fb950';x.fillStyle='#3fb950';x.lineWidth=lw;
+  x.beginPath();tr.forEach((p,j)=>j?x.lineTo(p.x,p.y):x.moveTo(p.x,p.y));x.stroke();
+  const ap=tr.reduce((a,b)=>b.y<a.y?b:a);x.beginPath();x.arc(ap.x,ap.y,lw*4,0,7);x.stroke();
+  const cur=tr.reduce((a,b)=>Math.abs(b.t-now)<Math.abs(a.t-now)?b:a);
+  if(Math.abs(cur.t-now)<0.05){x.beginPath();x.arc(cur.x,cur.y,lw*3,0,7);x.fill();
+   const r=lw*30,ang=cur.angle*Math.PI/180;x.beginPath();x.moveTo(cur.x-r*Math.cos(ang),cur.y-r*Math.sin(ang));x.lineTo(cur.x+r*Math.cos(ang),cur.y+r*Math.sin(ang));x.stroke();}
+  x.restore();}
+ A1.paint(x);
  const here=Object.keys(k.marks).filter(m=>Math.abs(k.marks[m]-rel(n))<1e-6)
   .map(m=>({takeoff:'Upphopp',apex:'Topp',open:'Öppning',water:'Vatten'}[m]));
  $('rs').value=n;$('info').textContent='Bild '+(n+1)+'/'+k.times.length+' · '+num(rel(n),2)+' s · '+k.speed+'×'+(here.length?' · '+here.join(', '):'');}
@@ -389,8 +755,55 @@ speedButtons($('sp'),setSpeed);
 async function save(){if(!R)return;
  const name=[$('diver').value,$('dive').value,$('board').value+'m'].map(s=>s.trim()).filter(Boolean).join(' ');
  await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
-  t0:R.times[0],t1:R.times[R.times.length-1],rot:R.rot,name,meta:{board:+$('board').value,marks:R.marks}})});
+  cam:R.cam,t0:R.times[0],t1:R.times[R.times.length-1],rot:R.rot,name,meta:{board:+$('board').value,marks:R.marks}})});
  clips();}
+
+// ---- TV replay, StroMotion, automatic analysis, AI feedback --------------------------------
+const post=(url,obj)=>fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj)});
+function diveRange(pad){ // marked takeoff..water with some margin, otherwise the whole replay
+ const m=R.marks,a=R.times[0],b=R.times[R.times.length-1];
+ return m.takeoff!=null&&m.water!=null?[Math.max(a,a+m.takeoff-pad),Math.min(b,a+m.water+pad)]:[a,b];}
+function tvShow(){if(!R)return;const[t0,t1]=diveRange(0.7);post('/api/tvreplay',{cam:R.cam,t0,t1,speed:R.speed}).then(u);}
+function tvHide(){post('/api/tvreplay',{}).then(u);}
+function stro(){if(!R)return;const[t0,t1]=diveRange(0.1),img=$('stroimg');
+ $('strotip').hidden=false;$('strotip').textContent='Beräknar…';img.hidden=true;
+ img.onload=()=>{img.hidden=false;$('strotip').textContent='Håll fingret på bilden → Spara i Bilder';};
+ img.onerror=()=>{$('strotip').textContent='Hittade ingen rörelse i reprisen.';};
+ img.src='/api/stro?cam='+R.cam+'&t0='+t0+'&t1='+t1+'&rot='+R.rot+'&every='+$('every').value+'&_='+Date.now();}
+async function analyse(){if(!R)return;const k=R,[t0,t1]=diveRange(0.2);$('trk').hidden=false;$('trk').textContent='Analyserar…';
+ const pts=await(await fetch('/api/track?cam='+k.cam+'&t0='+t0+'&t1='+t1+'&rot='+k.rot)).json();
+ if(k!==R)return;k.track=pts;draw();$('trk').innerHTML=trackText(pts,k);}
+function trackText(pts,k){
+ if(pts.length<5)return 'Hittade för lite rörelse. Markera Upphopp och Vatten och försök igen.';
+ const near=t=>pts.reduce((a,b)=>Math.abs(b.t-t)<Math.abs(a.t-t)?b:a);
+ const tk=k.marks.takeoff!=null?k.times[0]+k.marks.takeoff:null,tw=k.marks.water!=null?k.times[0]+k.marks.water:null;
+ const first=tk!=null?(pts.find(p=>p.t>=tk-0.001)||near(tk)):pts[0]; // first frame in the air
+ const lastp=tw!=null?([...pts].reverse().find(p=>p.t<=tw+0.001)||near(tw)):pts[pts.length-1];
+ const apex=pts.reduce((a,b)=>b.y<a.y?b:a),m=d=>SCALE?num(d*SCALE,2)+' m':Math.round(d)+' px';
+ let s='Högsta punkt <b>'+m(first.y-apex.y)+'</b> över upphoppet, '+m(Math.abs(apex.x-first.x))+' ut från upphoppet'
+  +'<br>Vattenkontakt '+m(Math.abs(lastp.x-first.x))+' ut från upphoppet';
+ // Somersaults: the body axis turns; the axis has no head/feet so it repeats every 180°.
+ const lo=k.marks.takeoff!=null?first.t:-1e9,hi=k.marks.water!=null?lastp.t:1e9;
+ const ok=pts.filter(p=>p.elong>1.6&&p.t>=lo&&p.t<=hi); // only while in the air
+ if(ok.length>=5){let acc=0;for(let j=1;j<ok.length;j++){let d=ok[j].angle-ok[j-1].angle;d=((d+90)%180+180)%180-90;acc+=d;}
+  const revs=Math.abs(acc)/360,secs=ok[ok.length-1].t-ok[0].t;
+  s+='<br>Rotation ≈ <b>'+num(revs,1)+' varv</b>'+(secs>0?', '+num(revs/secs,1)+' varv/s':'');
+  if(ok.length<pts.length*0.6)s+='<br><small>Osäker rotation: kroppen var ihopkrupen i många bilder.</small>';}
+ else s+='<br><small>Rotation: kan inte mätas (kroppen syns inte som avlång).</small>';
+ if(!SCALE)s+='<br><small>Kalibrera för att få meter.</small>';
+ return s;}
+async function feedback(){if(!R)return;$('fb').hidden=false;$('fb').textContent='Skriver…';
+ const plain=h=>h.replace(/<br>/g,'\n').replace(/<[^>]+>/g,'');
+ const text='Hoppare: '+($('diver').value||'-')+'\nHopp: '+($('dive').value||'-')+'\nHöjd: '+$('board').value+' m\n'
+  +plain($('phys').innerHTML)+'\n'+($('trk').hidden?'':plain($('trk').innerHTML));
+ const r=await post('/api/feedback',{text});$('fb').textContent=r.ok?(await r.json()).text:'Ingen språkmodell konfigurerad.';}
+
+// ---- Dives found automatically in the zone ------------------------------------------------
+async function evs(){const l=await(await fetch('/api/events')).json();
+ $('ev').innerHTML=l.length?l.map((e,j)=>'<div class="ev"><span>'+e.wall+' · '+num(e.t1-e.t0,0)+' s</span><button data-j="'+j+'">Visa</button></div>').join(''):'';
+ $('ev').onclick=ev=>{const b=ev.target.closest('button');if(!b)return;const e=l[+b.dataset.j];
+  loadReplay(0,e.t0,e.t1);$('rp').scrollIntoView({behavior:'smooth'});};}
+setInterval(evs,3000);evs();
 
 // ---- Compare two saved clips: side by side or overlaid, aligned on the takeoff mark ------
 const C={A:null,B:null,ma:0,mb:0,p:0,shift:0,playing:false,speed:1,mode:'side',busy:false,dirty:false};
@@ -469,41 +882,30 @@ if(!window.isSecureContext){$('tls').hidden=false;const l=$('https');l.href='htt
 </script></body></html>"""
 
 
-def clean_name(s):
-    # Letters (incl. åäö), digits, space, - _ . ; always ends in .mp4
-    s = "".join(ch for ch in s if ch.isalnum() or ch in " -_.").strip(" .").removesuffix(".mp4").strip(" .")[:80]
-    return s + ".mp4" if s else ""
-
-
-def clip_file(name):
-    # A finished clip in CLIPS, or None. Rejects paths and anything else.
-    f = CLIPS / name
-    return f if name == clean_name(name) and f.is_file() else None
-
-
-def meta_file(clip):
-    # Marks and board height saved next to the clip, used for measurements and aligning comparisons.
-    return clip.with_name(clip.name + ".json")
-
-
-def clean_meta(m):
-    marks = {k: float(v) for k, v in (m.get("marks") or {}).items()
-             if k in ("takeoff", "apex", "open", "water") and isinstance(v, (int, float))}
-    return {"board": float(m.get("board", 3)), "marks": marks}
-
-
 class Web(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        parts = [unquote(x) for x in self.path.split("?")[0].strip("/").split("/")]
+        url = urlsplit(self.path)
+        parts = [unquote(x) for x in url.path.strip("/").split("/")]
+        q = {k: v[0] for k, v in parse_qs(url.query).items()}
         try:
             if parts == ["api", "state"]:
                 return self.reply(200, json.dumps(status).encode(), "application/json")
-            if parts[:2] == ["api", "range"] and len(parts) == 4:
-                ts, _ = frames_between(float(parts[2]), float(parts[3]))
+            if parts == ["api", "events"]:
+                with detector.lock:
+                    return self.reply(200, json.dumps(detector.events[::-1]).encode(), "application/json")
+            if parts[:2] == ["api", "range"] and len(parts) == 5:
+                ts, _ = cam_of(parts[2]).between(float(parts[3]), float(parts[4]))
                 return self.reply(200, json.dumps({"times": ts}).encode(), "application/json")
-            if parts[0] == "frame" and len(parts) == 2:
-                frame = frame_at(float(parts[1]))
-                return self.reply(200, frame, "image/jpeg") if frame else self.reply(404, b"", "text/plain")
+            if parts[0] == "frame" and len(parts) == 3:
+                cam = cam_of(parts[1])
+                hit = cam.at(float(parts[2]))
+                return self.reply(200, cam.read(hit[1]), "image/jpeg") if hit else self.reply(404, b"", "text/plain")
+            if parts == ["api", "stro"]:
+                img = stromotion(cam_of(q["cam"]), float(q["t0"]), float(q["t1"]), rot_param(q), max(1, int(q.get("every", 5))))
+                return self.reply(200, img, "image/jpeg") if img else self.reply(404, b"", "text/plain")
+            if parts == ["api", "track"]:
+                pts = track(cam_of(q["cam"]), float(q["t0"]), float(q["t1"]), rot_param(q))
+                return self.reply(200, json.dumps(pts).encode(), "application/json")
             if parts == ["ca.crt"]:
                 return self.reply(200, (CERTS / "ca.crt").read_bytes(), "application/x-x509-ca-cert")
             if parts == ["api", "clips"]:
@@ -514,11 +916,12 @@ class Web(http.server.BaseHTTPRequestHandler):
                 return self.reply(200, json.dumps(clips).encode(), "application/json")
             if parts[0] == "clips" and len(parts) == 2 and clip_file(parts[1]):
                 return self.send_file(clip_file(parts[1]), "video/mp4")
-        except (ValueError, FileNotFoundError):
+        except (ValueError, KeyError, IndexError, FileNotFoundError):
             return self.reply(404, b"", "text/plain")
         self.reply(200, PAGE.encode(), "text/html; charset=utf-8")
 
     def do_POST(self):
+        global tv_replay
         parts = [unquote(x) for x in self.path.strip("/").split("/")]
         try:
             if parts[:3] == ["api", "clip", "delete"] and len(parts) == 4 and clip_file(parts[3]):
@@ -536,19 +939,45 @@ class Web(http.server.BaseHTTPRequestHandler):
                 clip.rename(CLIPS / new)
                 return self.reply(204, b"", "text/plain")
             if parts == ["api", "save"]:
-                body = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length", 0)), 65536)))
-                t0, t1, rot = float(body["t0"]), float(body["t1"]), body["rot"]
+                body = self.body()
+                cam, t0, t1, rot = cam_of(body["cam"]), float(body["t0"]), float(body["t1"]), body["rot"]
                 if not 0 < t1 - t0 <= MAX_CLIP_S or rot not in ROTATIONS:
                     return self.reply(400, b"", "text/plain")
-                stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(time.time() - (time.monotonic() - t0)))
-                base = f"{clean_name(str(body.get('name', ''))).removesuffix('.mp4') or 'hopp'} {stamp}"
-                name, n = base + ".mp4", 2
-                while (CLIPS / name).exists() or (CLIPS / (name + ".part")).exists():  # same second saved twice
-                    name, n = f"{base}-{n}.mp4", n + 1
-                meta_file(CLIPS / name).write_text(json.dumps(clean_meta(body.get("meta") or {})))
-                (CLIPS / (name + ".part")).touch()  # shows up as "saving" right away
-                threading.Thread(target=save_clip, args=(t0, t1, rot, name), daemon=True).start()
+                base = clean_name(str(body.get("name", ""))).removesuffix(".mp4") or "hopp"
+                meta = {**clean_meta(body.get("meta") or {}), "cam": cam.idx}
+                name = new_clip(cam, t0, t1, rot, base, meta)
                 return self.reply(202, json.dumps({"name": name}).encode(), "application/json")
+            if parts == ["api", "zone"]:
+                body = self.body()
+                if body:  # corners on the rotated picture -> camera picture
+                    rot = body["rot"] if body.get("rot") in ROTATIONS else "none"
+                    a = view_to_raw(float(body["x0"]), float(body["y0"]), rot)
+                    b = view_to_raw(float(body["x1"]), float(body["y1"]), rot)
+                    zone = [min(a[0], b[0]), min(a[1], b[1]), max(a[0], b[0]), max(a[1], b[1])]
+                    state["zone"] = [round(min(max(v, 0.0), 1.0), 4) for v in zone]
+                else:
+                    state["zone"] = None
+                save_state()
+                return self.reply(204, b"", "text/plain")
+            if parts == ["api", "tvreplay"]:
+                body = self.body()
+                if body:
+                    t0, t1 = float(body["t0"]), float(body["t1"])
+                    if not 0 < t1 - t0 <= MAX_CLIP_S:
+                        return self.reply(400, b"", "text/plain")
+                    tv_replay = {"cam": cam_of(body["cam"]), "t0": t0, "t1": t1,
+                                 "speed": min(max(float(body.get("speed", 1)), 0.05), 2.0), "start": time.monotonic()}
+                else:
+                    tv_replay = None
+                return self.reply(204, b"", "text/plain")
+            if parts == ["api", "feedback"]:
+                if not LLM_URL:
+                    return self.reply(404, b"", "text/plain")
+                try:
+                    text = llm_feedback(str(self.body()["text"])[:4000])
+                except OSError as e:
+                    text = f"Kunde inte nå språkmodellen ({e})."
+                return self.reply(200, json.dumps({"text": text}).encode(), "application/json")
             cmd = parts[1] if parts[0] == "api" and len(parts) in (2, 3) else ""
             v = float(parts[2]) if len(parts) == 3 else 0.0
         except (ValueError, IndexError, KeyError, TypeError, AttributeError):
@@ -557,6 +986,9 @@ class Web(http.server.BaseHTTPRequestHandler):
             return self.reply(404, b"", "text/plain")
         cmds.put((cmd, v))
         self.reply(204, b"", "text/plain")
+
+    def body(self):
+        return json.loads(self.rfile.read(min(int(self.headers.get("Content-Length", 0)), 65536)) or b"{}")
 
     def send_file(self, path, ctype):
         # Byte ranges are required for video playback in iPhone Safari.
@@ -591,6 +1023,17 @@ class Web(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def cam_of(i):
+    i = int(i)
+    if not 0 <= i < len(cams):
+        raise ValueError("no such camera")
+    return cams[i]
+
+
+def rot_param(q):
+    return q["rot"] if q.get("rot") in ROTATIONS else "none"
+
+
 def ensure_certs():
     # Own CA (installed once on the phone) signing a server cert for hoppdelay.local and the hotspot IP.
     if (CERTS / "server.crt").exists():
@@ -608,6 +1051,22 @@ def ensure_certs():
         subprocess.run(["openssl", *cmd.split()], cwd=CERTS, check=True, capture_output=True)
 
 
+# --- Start -----------------------------------------------------------------------------------
+CLIPS.mkdir(parents=True, exist_ok=True)  # saved clips are kept across restarts
+for f in CLIPS.glob("*.part"):  # unfinished saves
+    f.unlink()
+found = find_cameras()
+if not found:
+    raise SystemExit("No camera with MJPEG up to 1080p30 found")
+cams = [Camera(i, dev, w, h, MAX_DISK // len(found)) for i, (dev, w, h) in enumerate(found)]
+detector = Detector(cams[0])
+detector.start()
+for c in cams:
+    c.start()
+cmds = queue.Queue()  # (command, value) from keyboard and web, applied in the main loop
+status = {}  # snapshot for the web page, replaced every loop
+tv_replay = None  # replay looping in a corner of the TV: {"cam", "t0", "t1", "speed", "start"}
+
 ensure_certs()
 tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 tls.load_cert_chain(CERTS / "server.crt", CERTS / "server.key")
@@ -617,18 +1076,11 @@ for server in (http.server.ThreadingHTTPServer(("", 80), Web), https):
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
 # --- Main loop -------------------------------------------------------------------------------
-cap = Gst.parse_launch(
-    f"v4l2src device={CAM} ! image/jpeg,width={W},height={H},framerate={FPS}/1 ! "
-    "appsink name=sink emit-signals=true max-buffers=2 drop=true sync=false"
-)
-cap.get_by_name("sink").connect("new-sample", on_frame)
-cap.set_state(Gst.State.PLAYING)
 screen = screen_size()
-disp, src, txt = display(state["rot"], *screen)
-
+disp, src, txt, disp_key = None, None, None, None
 start = last = time.monotonic()
 review, paused, behind = False, False, 0.0  # review: rewound/paused, showing `behind` seconds back
-shown, label = None, None
+shown_key = None
 kbds, next_scan = {}, 0.0
 
 while True:
@@ -638,20 +1090,17 @@ while True:
         scan(kbds)
         next_scan = now + 5
         if screen_size() != screen:  # another screen plugged in
-            screen = screen_size()
-            disp.set_state(Gst.State.NULL)
-            disp, src, txt = display(state["rot"], *screen)
-            shown = None
-    with lock:
-        newest = times[-1] if times else start
-        span = now - times[0] if times else 0.0
-    for p in (cap, disp):
+            screen, disp_key = screen_size(), None
+    span, _ = cams[0].span(now)
+    for c in cams:
+        newest = c.span(now)[1]
+        if now - (newest if newest is not None else start) > 5:
+            raise SystemExit(f"No frames from camera {c.idx + 1} for 5 s")  # systemd restarts us
+    for p in [c.pipe for c in cams] + ([disp] if disp else []):
         msg = p.get_bus().pop_filtered(Gst.MessageType.ERROR)
         if msg:
             err, dbg = msg.parse_error()
-            raise SystemExit(f"GStreamer error: {err.message} ({dbg})")  # systemd restarts us
-    if now - newest > 5:
-        raise SystemExit("No frames from camera for 5 s")
+            raise SystemExit(f"GStreamer error: {err.message} ({dbg})")
 
     ready, _, _ = select.select(list(kbds.values()), [], [], 1 / FPS)
     for dev in ready:
@@ -670,11 +1119,15 @@ while True:
         elif cmd == "live":
             review = paused = False
         elif cmd == "rotate":
-            state["rot"] = ROTATIONS[(ROTATIONS.index(state["rot"]) + 1) % len(ROTATIONS)]
-            disp.set_state(Gst.State.NULL)
-            disp, src, txt = display(state["rot"], *screen)
-            shown = None
-        else:  # step / seek / pause enter review mode
+            i = int(v) if 0 <= int(v) < len(cams) else 0
+            state["rots"][str(i)] = ROTATIONS[(ROTATIONS.index(rot_of(i)) + 1) % len(ROTATIONS)]
+        elif cmd == "layout" and 0 <= int(v) < len(LAYOUTS):
+            state["layout"] = LAYOUTS[int(v)]
+        elif cmd == "layout_next":
+            state["layout"] = LAYOUTS[(LAYOUTS.index(state["layout"]) + 1) % len(LAYOUTS)]
+        elif cmd == "autosave":
+            state["autosave"] = bool(v)
+        elif cmd in ("step", "seek", "pause"):  # enter review mode
             if not review:
                 review, behind = True, float(state["delay"])
             if cmd == "step":
@@ -683,18 +1136,34 @@ while True:
                 behind = min(max(v, 0.0), span)
             else:
                 paused = not paused
-        STATE.write_text(json.dumps(state))
+        save_state()
 
     if paused:
         behind = min(behind + dt, span)  # frozen frame; stays inside the recording
     back = behind if review else state["delay"]
-    with lock:
-        if not refs:
-            continue
-        i = max(bisect.bisect_right(times, now - back) - 1, 0)
-        ref, tv = refs[i], times[i]  # tv: capture time of the frame on the TV
-    status = {"delay": state["delay"], "rot": state["rot"], "review": review,
-              "paused": paused, "behind": back, "span": span, "tv": tv}
+    layout = state["layout"] if len(cams) == 2 else "cam0"
+    visible = {"cam0": [0], "cam1": [1], "split": [0, 1], "pip": [0, 1]}[layout]
+    main = visible[0]
+    tvr = tv_replay
+    mode = "jpeg" if len(visible) == 1 and not tvr else "raw"
+    want = (mode, main, rot_of(main), screen) if mode == "jpeg" else (mode, screen)
+    if want != disp_key:
+        if disp:
+            disp.set_state(Gst.State.NULL)
+        disp, src, txt = display_jpeg(cams[main], rot_of(main), *screen) if mode == "jpeg" else display_raw(*screen)
+        disp_key, shown_key = want, None
+
+    hits = {i: cams[i].at(now - back) for i in visible}
+    if any(h is None for h in hits.values()):
+        continue
+    tv_hit = None
+    if tvr:
+        dur = tvr["t1"] - tvr["t0"]
+        tv_hit = tvr["cam"].at(tvr["t0"] + ((now - tvr["start"]) * tvr["speed"]) % dur)
+    tv = hits[main][0]
+    status = {"delay": state["delay"], "review": review, "paused": paused, "behind": back, "span": span, "tv": tv,
+              "layout": layout, "zone": state["zone"], "autosave": state["autosave"], "llm": bool(LLM_URL),
+              "tvrep": bool(tvr), "cams": [{"idx": c.idx, "w": c.w, "h": c.h, "rot": rot_of(c.idx)} for c in cams]}
 
     if span < back and not review:
         text = f"Buffrar {span:.0f}/{back} s"
@@ -702,11 +1171,18 @@ while True:
         text = f"{'Paus  ' if paused else ''}-{mmss(back)}   (Enter = tillbaka till {state['delay']} s)"
     else:
         text = f"Delay {state['delay']} s   inspelat {mmss(span)}"
-    if ref is not shown or text != label:
-        try:
-            frame = read_frame(ref)
-        except FileNotFoundError:  # that minute was just deleted to free disk
-            continue
+    key = (tuple(h[1] for h in hits.values()), tv_hit[1] if tv_hit else None, text)
+    if key == shown_key:
+        continue
+    try:
+        jpegs = {i: cams[i].read(h[1]) for i, h in hits.items()}
+        tv_frame = (tvr["cam"], tvr["cam"].read(tv_hit[1])) if tv_hit else None
+    except FileNotFoundError:  # that minute was just deleted to free disk
+        continue
+    if mode == "jpeg":
         txt.set_property("text", text)
-        src.emit("push-buffer", Gst.Buffer.new_wrapped(frame))
-        shown, label = ref, text
+        src.emit("push-buffer", Gst.Buffer.new_wrapped(jpegs[main]))
+    else:
+        canvas = compose(screen[0], screen[1], layout, {i: (cams[i], j) for i, j in jpegs.items()}, tv_frame, text)
+        src.emit("push-buffer", Gst.Buffer.new_wrapped(canvas.tobytes()))
+    shown_key = key
