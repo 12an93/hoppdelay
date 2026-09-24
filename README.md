@@ -13,7 +13,13 @@ or pool network needed: the box runs its own Wi-Fi.
 - The whole session is recorded to disk (up to 40 % of the disk, oldest minute dropped first).
 - Rewind, pause, change the delay and rotate – from the keyboard or the phone.
 - Replay on the phone while the TV keeps running: slow motion (½×, ¼×, ⅒×) and frame by frame.
-- Save clips as MP4, rename, delete, and save straight to Photos on iPhone.
+- Measure a dive by marking takeoff, top, opening and water entry: flight time, height of the
+  highest point above takeoff, and height above the water at the opening – from the board height,
+  no tracking needed.
+- Drawing tools on the replay: line, angle, and calibration against a known length for distances in metres.
+- Compare two saved dives side by side or overlaid, aligned on the takeoff, frame by frame.
+- Save clips as MP4 named by diver, dive and height; filter, rename, delete, and save straight to
+  Photos on iPhone.
 - Own Wi-Fi hotspot, starts by itself when power is connected.
 
 ## Hardware
@@ -72,3 +78,16 @@ HTTPS is required for iPhone to save clips straight to Photos. The certificates 
 | Space / B | Pause / play |
 | Enter / Esc | Back to normal delay |
 | R | Rotate 90° |
+
+## Measurements
+
+Mark **Takeoff** and **Water** (and optionally **Top** and **Opening**) while stepping frame by frame,
+and pick the board height. The numbers come from projectile motion of the centre of mass, assuming it
+drops about the board height from takeoff to entry. At 30 fps one frame is ±0.03 s, which is roughly
+±0.1–0.2 m on the height. A 60 fps camera halves that.
+
+## License
+
+[CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/): free to use, share and
+modify for non-commercial purposes – clubs, coaches and schools are welcome. Credit the author and
+share changes under the same license. Selling it or using it in a commercial product is not allowed.

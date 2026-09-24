@@ -12,7 +12,12 @@ från ett tangentbord/presentationsklickare eller från en iPhone via en egen we
 - Hela passet spelas in på disken (upp till 40 % av disken, äldsta minuten raderas först).
 - Spola, pausa, ändra delay och rotera – från tangentbord eller telefon.
 - Repris på telefonen medan TV:n fortsätter: slowmotion (½×, ¼×, ⅒×) och bild för bild.
-- Spara klipp som MP4, byt namn, radera, och spara direkt i Bilder på iPhone.
+- Mät ett hopp genom att markera upphopp, topp, öppning och vattenkontakt: flygtid, högsta punkt
+  över upphoppet och höjd över vattnet vid öppningen – räknat från svikthöjden, ingen spårning behövs.
+- Ritverktyg på reprisen: linje, vinkel och kalibrering mot en känd längd för avstånd i meter.
+- Jämför två sparade hopp sida vid sida eller överlagda, synkade på upphoppet, bild för bild.
+- Spara klipp som MP4 med hoppare, hopp och höjd i namnet; filtrera, byt namn, radera och spara direkt
+  i Bilder på iPhone.
 - Eget Wi-Fi (hotspot) – kräver inget nät i simhallen.
 
 ## Hårdvara
@@ -69,3 +74,16 @@ HTTPS behövs för att iPhone ska kunna spara klipp direkt i Bilder. Certifikate
 | Mellanslag / B | Paus / spela |
 | Enter / Esc | Tillbaka till vanlig delay |
 | R | Rotera 90° |
+
+## Mätning
+
+Markera **Upphopp** och **Vatten** (och gärna **Topp** och **Öppning**) medan du stegar bild för bild,
+och välj svikthöjd. Siffrorna räknas från tyngdpunktens kastbana, med antagandet att den faller ungefär
+svikthöjden från upphopp till vattenkontakt. Med 30 fps är en bild ±0,03 s, vilket ger ungefär
+±0,1–0,2 m på höjden. En 60 fps-kamera halverar det.
+
+## Licens
+
+[CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/deed.sv): fri att använda, dela och
+ändra i icke-kommersiellt syfte – klubbar, tränare och skolor är välkomna. Ange upphovspersonen och dela
+ändringar under samma licens. Det är inte tillåtet att sälja den eller använda den i en kommersiell produkt.

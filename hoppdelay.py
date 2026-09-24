@@ -136,8 +136,9 @@ def save_clip(t0, t1, rot, name):
     p = Gst.parse_launch(
         f"appsrc name=src format=time block=true caps=image/jpeg,width={W},height={H},framerate={FPS}/1 ! "
         f"jpegparse ! {DECODER} ! videoflip method={rot} ! videoconvert ! video/x-raw,format=NV12 ! "
-        f"{ENCODER} ! h264parse ! mp4mux ! filesink location={tmp}"
+        f"{ENCODER} ! h264parse ! mp4mux ! filesink name=sink"
     )
+    p.get_by_name("sink").set_property("location", str(tmp))  # names may contain spaces
     src = p.get_by_name("src")
     p.set_state(Gst.State.PLAYING)
     for t, ref in zip(ts, rs):
@@ -206,20 +207,26 @@ def mmss(s):
 cmds = queue.Queue()  # (command, value) from keyboard and web, applied in the main loop
 status = {}  # snapshot for the web page, replaced every loop
 
-PAGE = """<!doctype html><html lang="sv"><head><meta charset="utf-8">
+PAGE = r"""<!doctype html><html lang="sv"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes"><title>Hoppdelay</title>
 <style>
 body{margin:0;padding:16px;background:#111;color:#eee;font:17px -apple-system,sans-serif;user-select:none;-webkit-user-select:none}
 h1{font-size:28px;margin:4px 0 2px}h2{font-size:20px;margin:28px 0 6px;border-top:1px solid #333;padding-top:16px}
-#sub,#info{color:#999;margin-bottom:10px}
-.row{display:flex;gap:8px;margin:10px 0}.row>*{flex:1}
-button,select{background:#2a2a2a;color:#eee;border:0;border-radius:12px;padding:18px 0;font-size:20px;text-align:center}
+h3{font-size:16px;color:#bbb;margin:16px 0 0}
+#sub,#info,#cinfo{color:#999;margin:6px 0}
+.row{display:flex;gap:8px;margin:10px 0}.row>*{flex:1;min-width:0}
+button,select,input[type=text]{background:#2a2a2a;color:#eee;border:0;border-radius:12px;padding:18px 0;font-size:20px;text-align:center}
+input[type=text]{padding:14px 10px;font-size:17px;text-align:left}
 button:active{background:#444}.big{background:#1f6feb;width:100%}.on{background:#1f6feb}
+.tools button,.marks button{padding:12px 0;font-size:15px}
 input[type=range]{width:100%;height:40px}label{color:#999;font-size:14px}
 #d{text-align:center;font-size:24px;align-self:center}
-canvas{width:100%;max-height:65vh;object-fit:contain;background:#000;border-radius:8px}
-a{color:#58a6ff}#tls{background:#1c2a3a;border-radius:12px;padding:12px 14px;margin-bottom:12px;font-size:15px}#tls ol{margin:6px 0 0;padding-left:20px}.clip{display:flex;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid #222}
+canvas{width:100%;height:auto;display:block;background:#000;border-radius:8px}
+#phys{background:#1b1b1b;border-radius:10px;padding:10px 12px;font-size:15px;line-height:1.5}
+#phys small{color:#888}
+a{color:#58a6ff}#tls{background:#1c2a3a;border-radius:12px;padding:12px 14px;margin-bottom:12px;font-size:15px}#tls ol{margin:6px 0 0;padding-left:20px}
+.clip{display:flex;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid #222}
 .clip a{flex:1;word-break:break-all}.clip span{color:#999;font-size:14px}.clip button{padding:10px 14px;font-size:18px}
 </style></head><body>
 <div id="tls" hidden><b>Spara klipp direkt i Bilder</b> (görs en gång per telefon):<ol>
@@ -242,83 +249,223 @@ a{color:#58a6ff}#tls{background:#1c2a3a;border-radius:12px;padding:12px 14px;mar
 <option value="10">10 s</option><option value="15">15 s</option></select>
 <button onclick="grab()" style="flex:2">Ta repris av TV-bilden</button></div>
 <div id="rp" hidden>
+<div class="row tools" id="tb1"></div>
 <canvas id="cv"></canvas><div id="info"></div>
 <input type="range" id="rs" min="0" max="0" step="1" value="0">
 <div class="row"><button onclick="stepf(-1)">◀︎|</button><button onclick="play()" id="pl">▶︎</button><button onclick="stepf(1)">|▶︎</button></div>
 <div class="row" id="sp"><button data-s="1" class="on">1×</button><button data-s="0.5">½×</button><button data-s="0.25">¼×</button><button data-s="0.1">⅒×</button></div>
+<h3>Mätning – markera bilderna</h3>
+<div class="row marks" id="mk"><button data-m="takeoff">Upphopp</button><button data-m="apex">Topp</button>
+<button data-m="open">Öppning</button><button data-m="water">Vatten</button><button data-m="clear">Rensa</button></div>
+<div class="row"><label style="align-self:center;flex:0 0 auto">Svikt/torn</label><select id="board">
+<option value="1">1 m</option><option value="3" selected>3 m</option><option value="5">5 m</option>
+<option value="7.5">7,5 m</option><option value="10">10 m</option></select></div>
+<div id="phys"></div>
+<h3>Spara</h3>
+<div class="row"><input type="text" id="diver" placeholder="Hoppare"><input type="text" id="dive" placeholder="Hopp, t.ex. 5231D"></div>
 <button class="big" onclick="save()">Spara klipp</button>
 </div>
-<h2>Sparade klipp</h2><div id="cl">Inga än</div>
+
+<h2>Jämför två klipp</h2>
+<div class="row"><select id="ca"></select><select id="cb"></select></div>
+<div class="row"><button id="cmode" onclick="cMode()">Sida vid sida</button><button onclick="cLoad()">Ladda</button></div>
+<div id="cp" hidden>
+<div class="row tools" id="tb2"></div>
+<canvas id="cc"></canvas><div id="cinfo"></div>
+<div class="row"><button onclick="cStep(-1)">◀︎|</button><button onclick="cPlay()" id="cpl">▶︎</button><button onclick="cStep(1)">|▶︎</button></div>
+<div class="row" id="csp"><button data-s="1" class="on">1×</button><button data-s="0.5">½×</button><button data-s="0.25">¼×</button><button data-s="0.1">⅒×</button></div>
+<div class="row"><button onclick="cShift(-1)">B −1 bild</button><button onclick="cShift(1)">B +1 bild</button></div>
+</div>
+
+<h2>Sparade klipp</h2>
+<input type="text" id="cf" placeholder="Filtrera (namn, hopp, höjd …)" style="width:100%;box-sizing:border-box">
+<div id="cl">Inga än</div>
 
 <script>
-let drag=false,S={},R=null,lastT=0;const t=document.getElementById('t');
+const $=id=>document.getElementById(id),enc=encodeURIComponent,G=9.81;
+const esc=s=>String(s).replace(/[&<>"']/g,ch=>'&#'+ch.charCodeAt(0)+';');
+const num=(v,d)=>v.toFixed(d).replace('.',',');
+const ROT={none:0,clockwise:Math.PI/2,'rotate-180':Math.PI,counterclockwise:-Math.PI/2};
+const store=(k,v)=>{try{if(v===undefined)return localStorage.getItem(k);localStorage.setItem(k,v);}catch(e){}};
+let drag=false,S={},R=null,lastT=0;
+
+// ---- Live control ------------------------------------------------------------------------
 function c(x){fetch('/api/'+x,{method:'POST'}).then(u)}
-t.oninput=()=>{drag=true;c('seek/'+(-t.value))};t.onchange=()=>{drag=false};
+$('t').oninput=()=>{drag=true;c('seek/'+(-$('t').value))};$('t').onchange=()=>{drag=false};
 function f(s){s=Math.floor(s);return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')}
 function u(){fetch('/api/state').then(r=>r.json()).then(s=>{S=s;
- h.textContent=s.review?(s.paused?'Paus  ':'')+'−'+f(s.behind):'Delay '+s.delay+' s';
- sub.textContent='Inspelat '+f(s.span)+(s.review?' · tryck "Tillbaka" för delay':'');
- d.textContent=s.delay+' s';p.textContent=s.paused?'▶':'⏸';
- t.min=-s.span;if(!drag)t.value=-s.behind;})}
+ $('h').textContent=s.review?(s.paused?'Paus  ':'')+'−'+f(s.behind):'Delay '+s.delay+' s';
+ $('sub').textContent='Inspelat '+f(s.span)+(s.review?' · tryck "Tillbaka" för delay':'');
+ $('d').textContent=s.delay+' s';$('p').textContent=s.paused?'▶':'⏸';
+ $('t').min=-s.span;if(!drag)$('t').value=-s.behind;})}
 setInterval(u,500);u();
 
-// Replay on the phone: frames are fetched as JPEG blobs, decoded only around the current frame.
+// ---- Physics from marked frames ----------------------------------------------------------
+// Projectile motion of the centre of mass: it drops about the board height from takeoff to entry.
+function phys(m,H){
+ if(m.takeoff==null||m.water==null)return null;
+ const T=m.water-m.takeoff;if(T<=0)return null;
+ const v=(G*T*T/2-H)/T,r={T,v,ta:Math.max(v/G,0),rise:v>0?v*v/(2*G):0};
+ if(m.apex!=null&&m.apex>m.takeoff)r.riseApex=G*(m.apex-m.takeoff)**2/2;
+ if(m.open!=null&&m.open>m.takeoff){const to=m.open-m.takeoff;r.to=to;r.openH=H+v*to-G*to*to/2;}
+ return r;}
+function physText(m,H){const r=phys(m,H);
+ if(!r)return 'Markera minst <b>Upphopp</b> och <b>Vatten</b> (stega bild för bild).';
+ let s='Flygtid <b>'+num(r.T,2)+' s</b><br>Högsta punkt <b>'+num(r.rise,2)+' m</b> över upphoppet, efter '+num(r.ta,2)+' s';
+ if(r.riseApex!=null)s+='<br>Enligt toppmarkeringen: '+num(r.riseApex,2)+' m';
+ if(r.to!=null)s+='<br>Öppning efter '+num(r.to,2)+' s, <b>'+num(r.openH,1)+' m</b> över vattnet';
+ return s+'<br><small>±1 bild ≈ ±0,03 s. Räknat på att tyngdpunkten faller lika mycket som svikthöjden.</small>';}
+
+// ---- Drawing tools (line, angle, calibration) -------------------------------------------
+let SCALE=parseFloat(store('hd_scale'))||null; // metres per pixel, shared: the camera does not move
+const dist=(a,b)=>Math.hypot(a[0]-b[0],a[1]-b[1]);
+function annot(cv,redraw,bar){
+ const A={tool:null,pts:[],items:[]};
+ bar.innerHTML=[['line','Linje'],['angle','Vinkel'],['cal','Kalibrera'],['clear','Rensa']]
+  .map(([k,l])=>'<button data-t="'+k+'">'+l+'</button>').join('');
+ bar.onclick=e=>{const b=e.target.closest('button');if(!b)return;const k=b.dataset.t;
+  if(k==='clear'){A.items=[];A.pts=[];A.tool=null;}else{A.tool=A.tool===k?null:k;A.pts=[];}
+  bar.querySelectorAll('button').forEach(x=>x.classList.toggle('on',x.dataset.t===A.tool));redraw();};
+ cv.addEventListener('click',e=>{if(!A.tool)return;const r=cv.getBoundingClientRect();
+  A.pts.push([(e.clientX-r.left)*cv.width/r.width,(e.clientY-r.top)*cv.height/r.height]);
+  if(A.pts.length===(A.tool==='angle'?3:2)){
+   if(A.tool==='cal'){const m=parseFloat((prompt('Hur lång är linjen i meter? (t.ex. svikthöjden)','3')||'').replace(',','.'));
+    if(m>0){SCALE=m/dist(A.pts[0],A.pts[1]);store('hd_scale',SCALE);}}
+   else A.items.push({t:A.tool,p:A.pts});
+   A.pts=[];}
+  redraw();});
+ A.paint=x=>{const lw=Math.max(2,x.canvas.width/350);x.save();x.lineWidth=lw;x.strokeStyle=x.fillStyle='#ffd400';
+  x.font='bold '+Math.round(lw*9)+'px sans-serif';x.shadowColor='#000';x.shadowBlur=lw*2;
+  const dot=p=>{x.beginPath();x.arc(p[0],p[1],lw*2,0,7);x.fill();};
+  const path=ps=>{x.beginPath();ps.forEach((p,i)=>i?x.lineTo(p[0],p[1]):x.moveTo(p[0],p[1]));x.stroke();ps.forEach(dot);};
+  for(const it of A.items){path(it.p);
+   if(it.t==='line'){const d=dist(it.p[0],it.p[1]);
+    x.fillText(SCALE?num(d*SCALE,2)+' m':Math.round(d)+' px (kalibrera)',(it.p[0][0]+it.p[1][0])/2+lw*4,(it.p[0][1]+it.p[1][1])/2-lw*4);}
+   else{const[a,b,cc]=it.p;let g=Math.abs(Math.atan2(a[1]-b[1],a[0]-b[0])-Math.atan2(cc[1]-b[1],cc[0]-b[0]))*180/Math.PI;
+    if(g>180)g=360-g;x.fillText(Math.round(g)+'°',b[0]+lw*5,b[1]-lw*5);}}
+  if(A.pts.length)path(A.pts);x.restore();};
+ return A;}
+
+// ---- Replay on the phone: frames fetched as JPEG blobs, decoded only around the current frame
+const A1=annot($('cv'),()=>draw(),$('tb1'));
+$('board').value=store('hd_board')||'3';
+$('board').onchange=()=>{store('hd_board',$('board').value);showPhys();};
+function showPhys(){if(R)$('phys').innerHTML=physText(R.marks,+$('board').value);}
 async function grab(){
- const r=await(await fetch('/api/range/'+(S.tv-len.value)+'/'+S.tv)).json();
- if(!r.times.length){rp.hidden=false;info.textContent='Inget inspelat i det intervallet ännu';return;}
- const k={times:r.times,blobs:[],bm:new Map(),rot:S.rot,i:0,playing:false,speed:1,pos:0};
- R=k;rp.hidden=false;rs.max=k.times.length-1;setSpeed(1);pl.textContent='▶︎';
+ const r=await(await fetch('/api/range/'+(S.tv-$('len').value)+'/'+S.tv)).json();
+ if(!r.times.length){$('rp').hidden=false;$('info').textContent='Inget inspelat i det intervallet ännu';return;}
+ const k={times:r.times,blobs:[],bm:new Map(),rot:S.rot,i:0,playing:false,speed:1,pos:0,marks:{}};
+ R=k;$('rp').hidden=false;$('rs').max=k.times.length-1;setSpeed(1);$('pl').textContent='▶︎';showPhys();
+ A1.items=[];A1.pts=[];$('mk').querySelectorAll('button').forEach(x=>x.classList.remove('on')); // new dive: fresh marks and drawings
  let next=0,done=0;
  const worker=async()=>{while(next<k.times.length&&R===k){const n=next++;
   k.blobs[n]=await(await fetch('/frame/'+k.times[n])).blob();done++;
-  if(n===0)draw();if(R===k&&!k.playing)info.textContent='Laddar '+done+'/'+k.times.length;}};
+  if(n===0)draw();if(R===k&&!k.playing)$('info').textContent='Laddar '+done+'/'+k.times.length;}};
  await Promise.all([1,2,3,4,5,6].map(worker));if(R===k)draw();}
+const rel=n=>R.times[n]-R.times[0];
 async function draw(){const k=R,n=k&&k.i;if(!k||!k.blobs[n])return;
  let bm=k.bm.get(n);if(!bm){bm=await createImageBitmap(k.blobs[n]);k.bm.set(n,bm);
   if(k.bm.size>40){const[o,v]=k.bm.entries().next().value;v.close();k.bm.delete(o);}}
  if(k!==R||n!==k.i)return;
- const q=k.rot==='clockwise'||k.rot==='counterclockwise',w=q?bm.height:bm.width,hh=q?bm.width:bm.height;
+ const cv=$('cv'),q=k.rot==='clockwise'||k.rot==='counterclockwise',w=q?bm.height:bm.width,hh=q?bm.width:bm.height;
  if(cv.width!==w||cv.height!==hh){cv.width=w;cv.height=hh;}
- const x=cv.getContext('2d');x.save();x.translate(w/2,hh/2);
- x.rotate({none:0,clockwise:Math.PI/2,'rotate-180':Math.PI,counterclockwise:-Math.PI/2}[k.rot]);
- x.drawImage(bm,-bm.width/2,-bm.height/2);x.restore();
- rs.value=n;info.textContent='Bild '+(n+1)+'/'+k.times.length+' · '+(k.times[n]-k.times[0]).toFixed(2)+' s · '+k.speed+'×';}
+ const x=cv.getContext('2d');x.save();x.translate(w/2,hh/2);x.rotate(ROT[k.rot]);
+ x.drawImage(bm,-bm.width/2,-bm.height/2);x.restore();A1.paint(x);
+ const here=Object.keys(k.marks).filter(m=>Math.abs(k.marks[m]-rel(n))<1e-6)
+  .map(m=>({takeoff:'Upphopp',apex:'Topp',open:'Öppning',water:'Vatten'}[m]));
+ $('rs').value=n;$('info').textContent='Bild '+(n+1)+'/'+k.times.length+' · '+num(rel(n),2)+' s · '+k.speed+'×'+(here.length?' · '+here.join(', '):'');}
+$('mk').onclick=e=>{const b=e.target.closest('button');if(!b||!R)return;const m=b.dataset.m;
+ if(m==='clear')R.marks={};else R.marks[m]=rel(R.i);
+ $('mk').querySelectorAll('button').forEach(x=>x.classList.toggle('on',R.marks[x.dataset.m]!=null));showPhys();draw();};
 function idx(t){let lo=0,hi=R.times.length-1;while(lo<hi){const m=(lo+hi+1)>>1;if(R.times[m]<=t)lo=m;else hi=m-1;}return lo;}
-function tick(ts){if(R&&R.playing){R.pos+=(ts-lastT)/1000*R.speed;
- if(R.pos>R.times[R.times.length-1]-R.times[0])R.pos=0;
- const n=idx(R.times[0]+R.pos);if(n!==R.i){R.i=n;draw();}}lastT=ts;requestAnimationFrame(tick);}
+function seekTo(n){R.i=Math.min(Math.max(n,0),R.times.length-1);R.pos=rel(R.i);draw();}
+function play(){if(!R)return;R.playing=!R.playing;if(R.playing&&R.i>=R.times.length-1)seekTo(0);$('pl').textContent=R.playing?'⏸':'▶︎';}
+function stepf(dn){if(!R)return;R.playing=false;$('pl').textContent='▶︎';seekTo(R.i+dn);}
+$('rs').oninput=()=>{R.playing=false;$('pl').textContent='▶︎';seekTo(+$('rs').value);};
+function speedButtons(bar,set){bar.querySelectorAll('button').forEach(b=>b.onclick=()=>set(+b.dataset.s));}
+function markSpeed(bar,v){bar.querySelectorAll('button').forEach(b=>b.classList.toggle('on',+b.dataset.s===v));}
+function setSpeed(v){if(R)R.speed=v;markSpeed($('sp'),v);if(R)draw();}
+speedButtons($('sp'),setSpeed);
+async function save(){if(!R)return;
+ const name=[$('diver').value,$('dive').value,$('board').value+'m'].map(s=>s.trim()).filter(Boolean).join(' ');
+ await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+  t0:R.times[0],t1:R.times[R.times.length-1],rot:R.rot,name,meta:{board:+$('board').value,marks:R.marks}})});
+ clips();}
+
+// ---- Compare two saved clips: side by side or overlaid, aligned on the takeoff mark ------
+const C={A:null,B:null,ma:0,mb:0,p:0,shift:0,playing:false,speed:1,mode:'side',busy:false,dirty:false};
+const A2=annot($('cc'),()=>drawC(),$('tb2'));
+function cMode(){C.mode=C.mode==='side'?'overlay':'side';$('cmode').textContent=C.mode==='side'?'Sida vid sida':'Överlägg';if(C.A)cRender();}
+async function cLoad(){const a=$('ca').value,b=$('cb').value;if(!a||!b)return;$('cp').hidden=false;$('cinfo').textContent='Laddar…';
+ const mk=n=>{const v=document.createElement('video');v.muted=true;v.playsInline=true;v.setAttribute('playsinline','');
+  v.preload='auto';v.src='/clips/'+enc(n);return v;};
+ const A=mk(a),B=mk(b);
+ [A,B].forEach(v=>{const p=v.play();if(p)p.then(()=>v.pause()).catch(()=>{});}); // iOS decodes frames only after play() in a tap
+ await Promise.all([A,B].map(v=>new Promise(res=>{if(v.readyState>=2)return res();v.addEventListener('loadeddata',res,{once:true});})));
+ A.pause();B.pause();
+ const mark=n=>((CL[n]||{}).meta||{}).marks||{};
+ Object.assign(C,{A,B,ma:mark(a).takeoff||0,mb:mark(b).takeoff||0,shift:0,playing:false,names:[a,b]});
+ C.p=-Math.max(C.ma,C.mb);$('cpl').textContent='▶︎';cRender();}
+const cRange=()=>[-Math.max(C.ma,C.mb),Math.max(C.A.duration-C.ma,C.B.duration-C.mb)];
+const clampT=(v,t)=>Math.min(Math.max(t,0),Math.max(v.duration-0.001,0));
+function seek(v,t){return new Promise(res=>{if(Math.abs(v.currentTime-t)<0.0005)return res();v.addEventListener('seeked',res,{once:true});v.currentTime=t;});}
+async function cRender(){if(!C.A)return;if(C.busy){C.dirty=true;return;}C.busy=true;
+ const mid=0.5/30; // aim at the middle of a frame, not its edge
+ do{C.dirty=false;await Promise.all([seek(C.A,clampT(C.A,C.ma+C.p+mid)),seek(C.B,clampT(C.B,C.mb+C.p+C.shift/30+mid))]);drawC();}while(C.dirty);
+ C.busy=false;}
+function drawC(){if(!C.A)return;const{A,B}=C,w=A.videoWidth,h=A.videoHeight,side=C.mode==='side',cc=$('cc');
+ const W=side?w*2:w;if(cc.width!==W||cc.height!==h){cc.width=W;cc.height=h;}
+ const x=cc.getContext('2d');x.fillStyle='#000';x.fillRect(0,0,W,h);
+ const fit=(v,x0,al)=>{const s=Math.min(w/v.videoWidth,h/v.videoHeight),vw=v.videoWidth*s,vh=v.videoHeight*s;
+  x.globalAlpha=al;x.drawImage(v,x0+(w-vw)/2,(h-vh)/2,vw,vh);};
+ fit(A,0,1);fit(B,side?w:0,side?1:0.5);x.globalAlpha=1;
+ x.font='bold '+Math.round(w/25)+'px sans-serif';x.fillStyle='#ffd400';x.fillText('A',w/40,w/20);x.fillText('B',(side?w:w/12)+w/40,w/20);
+ A2.paint(x);
+ const info=n=>{const m=(CL[n]||{}).meta;const r=m&&phys(m.marks||{},m.board||3);return r?'flygtid '+num(r.T,2)+' s, topp '+num(r.rise,2)+' m':'ej mätt';};
+ $('cinfo').innerHTML=(C.p>=0?'+':'')+num(C.p,2)+' s från upphopp · B '+(C.shift>=0?'+':'')+C.shift+' bild · '+C.speed+'×'
+  +'<br>A: '+esc(C.names[0])+' – '+info(C.names[0])+'<br>B: '+esc(C.names[1])+' – '+info(C.names[1]);}
+function cStep(d){if(!C.A)return;C.playing=false;$('cpl').textContent='▶︎';C.p+=d/30;cRender();}
+function cShift(d){if(!C.A)return;C.shift+=d;cRender();}
+function cPlay(){if(!C.A)return;C.playing=!C.playing;$('cpl').textContent=C.playing?'⏸':'▶︎';}
+speedButtons($('csp'),v=>{C.speed=v;markSpeed($('csp'),v);if(C.A)drawC();});
+
+function tick(ts){const dt=(ts-lastT)/1000;lastT=ts;
+ if(R&&R.playing){R.pos+=dt*R.speed;if(R.pos>rel(R.times.length-1))R.pos=0;
+  const n=idx(R.times[0]+R.pos);if(n!==R.i){R.i=n;draw();}}
+ if(C.A&&C.playing){const[lo,hi]=cRange();C.p+=dt*C.speed;if(C.p>hi)C.p=lo;cRender();}
+ requestAnimationFrame(tick);}
 requestAnimationFrame(tick);
-function seekTo(n){R.i=Math.min(Math.max(n,0),R.times.length-1);R.pos=R.times[R.i]-R.times[0];draw();}
-function play(){if(!R)return;R.playing=!R.playing;if(R.playing&&R.i>=R.times.length-1)seekTo(0);pl.textContent=R.playing?'⏸':'▶︎';}
-function stepf(dn){if(!R)return;R.playing=false;pl.textContent='▶︎';seekTo(R.i+dn);}
-rs.oninput=()=>{R.playing=false;pl.textContent='▶︎';seekTo(+rs.value);};
-function setSpeed(v){if(R)R.speed=v;document.querySelectorAll('#sp button').forEach(b=>b.classList.toggle('on',+b.dataset.s===v));if(R)draw();}
-document.querySelectorAll('#sp button').forEach(b=>b.onclick=()=>setSpeed(+b.dataset.s));
-async function save(){if(!R)return;await fetch('/api/save/'+R.times[0]+'/'+R.times[R.times.length-1]+'/'+R.rot,{method:'POST'});clips();}
-const esc=s=>s.replace(/[&<>"']/g,ch=>'&#'+ch.charCodeAt(0)+';'),enc=encodeURIComponent;
+
+// ---- Saved clips: filter, share to Photos, rename, delete ---------------------------------
 // Sharing a file (-> "Spara video" to Photos) needs HTTPS and a file fetched before the tap,
 // so the first tap downloads (⬇︎), the second opens the share sheet (📲).
-const files={},loading=new Set();
+let CL={},LIST=[];const files={},loading=new Set();
 const share=x=>!window.isSecureContext?'':'<button data-n="'+esc(x.name)+'" data-a="share"'
  +(files[x.name]?' class="on">📲':'>'+(loading.has(x.name)?'…':'⬇︎'))+'</button>';
-async function clips(){const l=await(await fetch('/api/clips')).json();
- cl.innerHTML=l.length?l.map(x=>x.ready
+function renderClips(){const q=$('cf').value.trim().toLowerCase();
+ const l=LIST.filter(x=>!q||x.name.toLowerCase().includes(q));
+ $('cl').innerHTML=l.length?l.map(x=>x.ready
   ?'<div class="clip"><a href="/clips/'+enc(x.name)+'">'+esc(x.name.replace(/[.]mp4$/,''))+'</a><span>'+x.mb+' MB</span>'+share(x)
    +'<button data-n="'+esc(x.name)+'" data-a="rename">✎</button><button data-n="'+esc(x.name)+'" data-a="delete">🗑</button></div>'
-  :'<div class="clip">'+esc(x.name)+' · sparas…</div>').join(''):'Inga än';}
-cl.onclick=async e=>{const b=e.target.closest('button');if(!b)return;const n=b.dataset.n;
+  :'<div class="clip">'+esc(x.name)+' · sparas…</div>').join(''):(LIST.length?'Inga träffar':'Inga än');
+ for(const id of ['ca','cb']){const s=$(id),v=s.value,ready=LIST.filter(x=>x.ready);
+  s.innerHTML='<option value="">'+(id==='ca'?'Klipp A':'Klipp B')+'</option>'+ready.map(x=>'<option value="'+esc(x.name)+'">'+esc(x.name.replace(/[.]mp4$/,''))+'</option>').join('');
+  if(ready.some(x=>x.name===v))s.value=v;}}
+async function clips(){LIST=await(await fetch('/api/clips')).json();CL={};LIST.forEach(x=>CL[x.name]=x);renderClips();}
+$('cf').oninput=renderClips;
+$('cl').onclick=async e=>{const b=e.target.closest('button');if(!b)return;const n=b.dataset.n;
  if(b.dataset.a==='share'){
   if(files[n]){try{await navigator.share({files:[files[n]]});}catch(err){}return;}
-  if(loading.has(n))return;loading.add(n);clips();
+  if(loading.has(n))return;loading.add(n);renderClips();
   const bl=await(await fetch('/clips/'+enc(n))).blob();files[n]=new File([bl],n,{type:'video/mp4'});
-  loading.delete(n);return clips();}
+  loading.delete(n);return renderClips();}
  delete files[n];
  if(b.dataset.a==='delete'){if(!confirm('Radera '+n+'?'))return;await fetch('/api/clip/delete/'+enc(n),{method:'POST'});}
  else{const v=prompt('Nytt namn',n.replace(/[.]mp4$/,''));if(!v)return;
   const r=await fetch('/api/clip/rename/'+enc(n)+'/'+enc(v),{method:'POST'});if(r.status===409)alert('Namnet är upptaget eller ogiltigt');}
  clips();};
 setInterval(clips,3000);clips();
-if(!window.isSecureContext){tls.hidden=false;https.href='https://'+(location.hostname==='10.42.0.1'?'10.42.0.1':'hoppdelay.local')+'/';https.textContent=https.href;}
+if(!window.isSecureContext){$('tls').hidden=false;const l=$('https');l.href='https://'+(location.hostname==='10.42.0.1'?'10.42.0.1':'hoppdelay.local')+'/';l.textContent=l.href;}
 </script></body></html>"""
 
 
@@ -332,6 +479,17 @@ def clip_file(name):
     # A finished clip in CLIPS, or None. Rejects paths and anything else.
     f = CLIPS / name
     return f if name == clean_name(name) and f.is_file() else None
+
+
+def meta_file(clip):
+    # Marks and board height saved next to the clip, used for measurements and aligning comparisons.
+    return clip.with_name(clip.name + ".json")
+
+
+def clean_meta(m):
+    marks = {k: float(v) for k, v in (m.get("marks") or {}).items()
+             if k in ("takeoff", "apex", "open", "water") and isinstance(v, (int, float))}
+    return {"board": float(m.get("board", 3)), "marks": marks}
 
 
 class Web(http.server.BaseHTTPRequestHandler):
@@ -349,9 +507,10 @@ class Web(http.server.BaseHTTPRequestHandler):
             if parts == ["ca.crt"]:
                 return self.reply(200, (CERTS / "ca.crt").read_bytes(), "application/x-x509-ca-cert")
             if parts == ["api", "clips"]:
-                files = sorted(CLIPS.iterdir(), key=lambda f: f.stat().st_mtime, reverse=True)
+                files = sorted((f for f in CLIPS.iterdir() if f.suffix != ".json"), key=lambda f: f.stat().st_mtime, reverse=True)
                 clips = [{"name": f.name.removesuffix(".part"), "mb": round(f.stat().st_size / 1e6, 1),
-                          "ready": f.suffix == ".mp4"} for f in files]
+                          "ready": f.suffix == ".mp4",
+                          "meta": json.loads(meta_file(f).read_text()) if meta_file(f).exists() else None} for f in files]
                 return self.reply(200, json.dumps(clips).encode(), "application/json")
             if parts[0] == "clips" and len(parts) == 2 and clip_file(parts[1]):
                 return self.send_file(clip_file(parts[1]), "video/mp4")
@@ -363,28 +522,36 @@ class Web(http.server.BaseHTTPRequestHandler):
         parts = [unquote(x) for x in self.path.strip("/").split("/")]
         try:
             if parts[:3] == ["api", "clip", "delete"] and len(parts) == 4 and clip_file(parts[3]):
-                clip_file(parts[3]).unlink()
+                clip = clip_file(parts[3])
+                clip.unlink()
+                meta_file(clip).unlink(missing_ok=True)
                 return self.reply(204, b"", "text/plain")
             if parts[:3] == ["api", "clip", "rename"] and len(parts) == 5 and clip_file(parts[3]):
                 new = clean_name(parts[4])
                 if not new or (CLIPS / new).exists():
                     return self.reply(409, b"", "text/plain")
-                clip_file(parts[3]).rename(CLIPS / new)
+                clip = clip_file(parts[3])
+                if meta_file(clip).exists():
+                    meta_file(clip).rename(meta_file(CLIPS / new))
+                clip.rename(CLIPS / new)
                 return self.reply(204, b"", "text/plain")
-            if parts[:2] == ["api", "save"] and len(parts) == 5:
-                t0, t1, rot = float(parts[2]), float(parts[3]), parts[4]
+            if parts == ["api", "save"]:
+                body = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length", 0)), 65536)))
+                t0, t1, rot = float(body["t0"]), float(body["t1"]), body["rot"]
                 if not 0 < t1 - t0 <= MAX_CLIP_S or rot not in ROTATIONS:
                     return self.reply(400, b"", "text/plain")
-                base = time.strftime("hopp-%Y%m%d-%H%M%S", time.localtime(time.time() - (time.monotonic() - t0)))
+                stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(time.time() - (time.monotonic() - t0)))
+                base = f"{clean_name(str(body.get('name', ''))).removesuffix('.mp4') or 'hopp'} {stamp}"
                 name, n = base + ".mp4", 2
                 while (CLIPS / name).exists() or (CLIPS / (name + ".part")).exists():  # same second saved twice
                     name, n = f"{base}-{n}.mp4", n + 1
+                meta_file(CLIPS / name).write_text(json.dumps(clean_meta(body.get("meta") or {})))
                 (CLIPS / (name + ".part")).touch()  # shows up as "saving" right away
                 threading.Thread(target=save_clip, args=(t0, t1, rot, name), daemon=True).start()
                 return self.reply(202, json.dumps({"name": name}).encode(), "application/json")
             cmd = parts[1] if parts[0] == "api" and len(parts) in (2, 3) else ""
             v = float(parts[2]) if len(parts) == 3 else 0.0
-        except (ValueError, IndexError):
+        except (ValueError, IndexError, KeyError, TypeError, AttributeError):
             return self.reply(400, b"", "text/plain")
         if cmd not in COMMANDS:
             return self.reply(404, b"", "text/plain")
