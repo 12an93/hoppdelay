@@ -125,6 +125,10 @@ The box must be able to reach the endpoint, which usually means not at the pool.
 
 ## License
 
+Created by Jesper ([@Tolvers2026](https://github.com/12an93)). Videos and pictures made by Hoppdelay carry a faint
+@Tolvers2026 mark in the lower right corner.
+
+
 [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/): free to use, share and
 modify for non-commercial purposes – clubs, coaches and schools are welcome. Credit the author and
 share changes under the same license. Selling it or using it in a commercial product is not allowed.

@@ -120,6 +120,10 @@ nå tjänsten, vilket oftast betyder att det inte fungerar i simhallen.
 
 ## Licens
 
+Skapad av Jesper ([@Tolvers2026](https://github.com/12an93)). Videor och bilder från Hoppdelay har en svag
+@Tolvers2026-märkning i nedre högra hörnet.
+
+
 [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/deed.sv): fri att använda, dela och
 ändra i icke-kommersiellt syfte – klubbar, tränare och skolor är välkomna. Ange upphovspersonen och dela
 ändringar under samma licens. Det är inte tillåtet att sälja den eller använda den i en kommersiell produkt.

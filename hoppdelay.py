@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Hoppdelay – delayed video replay for diving practice.
+# Copyright (c) 2026 Jesper (@Tolvers2026). Licensed under CC BY-NC-SA 4.0 – keep this notice.
 # Records one or two USB cameras to disk (whole session), plays back delayed on HDMI, and is
 # controlled from a keyboard/clicker or a phone (web page, HTTP 80 / HTTPS 443).
 # Keys:
@@ -35,6 +36,10 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gst
 
 FPS = 30
+WATERMARK = "@Tolvers2026"  # creator mark on every video and picture made here, intentionally hard-coded
+# Faint GStreamer text in the lower right corner (ARGB colour: about 30 % white).
+WATERMARK_GST = (f'textoverlay text="{WATERMARK}" valignment=bottom halignment=right font-desc="Sans 11" '
+                 'color=0x4dffffff draw-shadow=false draw-outline=false xpad=24 ypad=16')
 REC = pathlib.Path("/var/lib/hoppdelay")
 CLIPS = REC / "clips"
 CERTS = pathlib.Path("/etc/hoppdelay")  # own CA + server cert: iPhone needs HTTPS to share files to Photos
@@ -196,7 +201,7 @@ def save_clip(cam, t0, t1, rot, name):
     tmp = CLIPS / (name + ".part")
     p = Gst.parse_launch(
         f"appsrc name=src format=time block=true caps=image/jpeg,width={cam.w},height={cam.h},framerate={FPS}/1 ! "
-        f"jpegparse ! {DECODER} ! videoflip method={rot} ! videoconvert ! video/x-raw,format=NV12 ! "
+        f"jpegparse ! {DECODER} ! videoflip method={rot} ! videoconvert ! {WATERMARK_GST} ! videoconvert ! video/x-raw,format=NV12 ! "
         f"{ENCODER} ! h264parse ! mp4mux ! filesink name=sink"
     )
     p.get_by_name("sink").set_property("location", str(tmp))  # names may contain spaces
@@ -293,6 +298,7 @@ def stromotion(cam, t0, t1, rot, every):
         if blob is not None:
             blob = cv2.dilate(blob, np.ones((5, 5), np.uint8)).astype(bool)
             out[blob] = img[blob]
+    watermark(out)
     return cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 90])[1].tobytes()
 
 
@@ -417,6 +423,7 @@ def display_jpeg(cam, rot, sw, sh, conn):
         f"jpegparse ! {DECODER} ! videoflip method={rot} ! videoconvert ! "
         f"videoscale add-borders=true ! video/x-raw,width={sw},height={sh},pixel-aspect-ratio=1/1 ! "
         'textoverlay name=txt valignment=top halignment=left font-desc="Sans 20" ! '
+        f"{WATERMARK_GST} ! "
         f"videoconvert ! kmssink sync=false force-modesetting=true connector-id={conn}"
     )
     p.set_state(Gst.State.PLAYING)
@@ -447,6 +454,18 @@ def paste(canvas, img, x, y, bw, bh, border=False):
     canvas[y:y + h, x:x + w] = img
     if border:
         cv2.rectangle(canvas, (x - 2, y - 2), (x + w + 1, y + h + 1), (255, 255, 255), 2)
+
+
+def watermark(img):
+    # Faint creator mark in the lower right corner, blended in at about 30 %.
+    h, w = img.shape[:2]
+    size, thick = h / 1500, max(1, round(h / 1000))
+    (tw, th), base = cv2.getTextSize(WATERMARK, cv2.FONT_HERSHEY_SIMPLEX, size, thick)
+    x0, y0, x1, y1 = w - tw - w // 60 - 2, h - th - base - h // 60 - 2, w - w // 60 + 2, h - h // 60 + 2
+    roi = img[y0:y1, x0:x1]
+    mark = roi.copy()
+    cv2.putText(mark, WATERMARK, (2, th + 2), cv2.FONT_HERSHEY_SIMPLEX, size, (255, 255, 255), thick, cv2.LINE_AA)
+    cv2.addWeighted(mark, 0.3, roi, 0.7, 0, dst=roi)
 
 
 def put_text(canvas, text, x, y, size):
@@ -481,6 +500,7 @@ def compose(sw, sh, layout, shown, tv_frame, text):
         paste(canvas, decode_for(cam, jpeg, rot_of(cam.idx), sw // 3), 16, sh * 2 // 3 - 16, sw // 3, sh // 3, True)
         put_text(canvas, "Repris", 24, sh * 2 // 3, sh / 1000)
     put_text(canvas, text, 16, int(sh / 22), sh / 1200)
+    watermark(canvas)
     return canvas
 
 
