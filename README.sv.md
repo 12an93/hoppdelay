@@ -25,6 +25,8 @@ från ett tangentbord/presentationsklickare eller från en iPhone via en egen we
   (och kan sparas automatiskt).
 - StroMotion-bild: hopparen inklistrad var N:e bild längs banan, i en enda bild.
 - Automatisk analys av ett hopp: bana, högsta punkt, avstånd ut från svikten, antal varv och varv per sekund.
+- Valfri AI-kroppsanalys (RTMPose): skelett på reprisen, höft- och knävinklar, när hopparen öppnar,
+  varv räknade på bålen (fungerar även i kort position) och kroppslinjen vid vattnet.
 - Valfri AI-feedback skriven från mätvärdena, via valfri OpenAI-kompatibel tjänst (t.ex. Ollama).
 - Eget Wi-Fi (hotspot) – kräver inget nät i simhallen.
 
@@ -106,6 +108,21 @@ och ritar banan på reprisen. Markera **Upphopp** och **Vatten** först och kali
 Rotationen räknas från kroppens längdaxel, så den fungerar bra i rak och pik men sämre i kort position –
 sidan säger till när den är osäker.
 
+## AI-kroppsanalys (valfritt)
+
+**Analysera kroppen (AI)** kör [RTMPose](https://github.com/open-mmlab/mmpose/tree/main/projects/rtmpose)
+(Apache-2.0) på processorn, några sekunder per hopp. Hopparen klipps ut och vrids upprätt innan modellen
+ser henne, eftersom pose-modeller är tränade på stående människor. Installera en gång, med internet:
+
+```
+sudo apt install -y python3-pip && sudo pip install --break-system-packages onnxruntime
+curl -fsSLo /tmp/rtm.zip https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-m_simcc-body7_pt-body7_420e-256x192-e48f03d0_20230504.zip && sudo mkdir -p /var/lib/hoppdelay/models && sudo python3 -c "import zipfile; z=zipfile.ZipFile('/tmp/rtm.zip'); open('/var/lib/hoppdelay/models/rtmpose-m.onnx','wb').write(z.read([n for n in z.namelist() if n.endswith('end2end.onnx')][0]))" && sudo systemctl restart hoppdelay
+```
+
+Knappen dyker upp när modellen finns på plats. Sidan visar tätaste höftvinkel, mest böjda knä, när höften
+överstiger 150° (ett tryck sätter det som markeringen **Öppning**), varv räknade på bålen och kroppslinjen
+vid vattnet. Det är en uppskattning: stäm av mot videon.
+
 ## AI-feedback (valfritt)
 
 Ange en OpenAI-kompatibel chattjänst i `hoppdelay.service`, till exempel Ollama på en annan dator:
@@ -119,6 +136,10 @@ Environment=HOPPDELAY_LLM_MODEL=qwen3:8b
 nå tjänsten, vilket oftast betyder att det inte fungerar i simhallen.
 
 ## Licens
+
+Skapad av Jesper ([@Tolvers2026](https://github.com/12an93)). Videor och bilder från Hoppdelay har en svag
+@Tolvers2026-märkning i nedre högra hörnet.
+
 
 [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/deed.sv): fri att använda, dela och
 ändra i icke-kommersiellt syfte – klubbar, tränare och skolor är välkomna. Ange upphovspersonen och dela

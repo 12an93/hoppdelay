@@ -28,6 +28,8 @@ or pool network needed: the box runs its own Wi-Fi.
 - StroMotion picture: the diver pasted in every few frames along the path, in one image.
 - Automatic analysis of a dive: path, highest point, distance out from the board, and number of
   somersaults and turns per second.
+- Optional AI body pose (RTMPose): skeleton on the replay, hip and knee angles, when the diver
+  opens, somersaults counted from the trunk (works in tuck too), and body line at entry.
 - Optional AI feedback written from the measurements, using any OpenAI-compatible endpoint (e.g. Ollama).
 - Own Wi-Fi hotspot, starts by itself when power is connected.
 
@@ -111,6 +113,21 @@ not move) and draws the path on the replay. Mark **Takeoff** and **Water** first
 for metres. Rotation is counted from the body axis, so it works well in straight and pike, less well in
 tuck – the page says when it is uncertain.
 
+## AI body pose (optional)
+
+**Analyse the body (AI)** runs [RTMPose](https://github.com/open-mmlab/mmpose/tree/main/projects/rtmpose)
+(Apache-2.0) on the CPU, a few seconds per dive. The diver is cut out and turned upright before the
+model sees her, since pose models are trained on people standing up. Install once, with internet:
+
+```
+sudo apt install -y python3-pip && sudo pip install --break-system-packages onnxruntime
+curl -fsSLo /tmp/rtm.zip https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-m_simcc-body7_pt-body7_420e-256x192-e48f03d0_20230504.zip && sudo mkdir -p /var/lib/hoppdelay/models && sudo python3 -c "import zipfile; z=zipfile.ZipFile('/tmp/rtm.zip'); open('/var/lib/hoppdelay/models/rtmpose-m.onnx','wb').write(z.read([n for n in z.namelist() if n.endswith('end2end.onnx')][0]))" && sudo systemctl restart hoppdelay
+```
+
+The button shows up when the model is in place. The page reports the tightest hip angle, the most bent
+knee, when the hip opens past 150° (one tap sets it as the **Opening** mark), somersaults counted from
+the trunk, and the body line at the water. It is an estimate: check it against the video.
+
 ## AI feedback (optional)
 
 Set an OpenAI-compatible chat endpoint in `hoppdelay.service`, for example Ollama on another machine:
@@ -124,6 +141,10 @@ Environment=HOPPDELAY_LLM_MODEL=qwen3:8b
 The box must be able to reach the endpoint, which usually means not at the pool.
 
 ## License
+
+Created by Jesper ([@Tolvers2026](https://github.com/12an93)). Videos and pictures made by Hoppdelay carry a faint
+@Tolvers2026 mark in the lower right corner.
+
 
 [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/): free to use, share and
 modify for non-commercial purposes – clubs, coaches and schools are welcome. Credit the author and
