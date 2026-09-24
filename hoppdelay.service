@@ -3,7 +3,10 @@ Description=Hoppdelay
 After=multi-user.target
 
 [Service]
-ExecStartPre=-/usr/bin/v4l2-ctl -d /dev/v4l/by-id/usb-GN_Jabra_A_S_Jabra_PanaCast_20_A9002000849C-0-video-index0 -c zoom_absolute=100,pan_absolute=0,tilt_absolute=0,power_line_frequency=1
+# Optional: pick a specific camera (default: first USB camera). List them with: ls /dev/v4l/by-id/
+#Environment=HOPPDELAY_CAM=/dev/v4l/by-id/usb-...-video-index0
+# Jabra PanaCast 20 only: widest view, centered, 50 Hz anti-flicker. Harmless if the camera is missing.
+ExecStartPre=-/bin/sh -c 'for c in /dev/v4l/by-id/*PanaCast_20*-video-index0; do v4l2-ctl -d "$c" -c zoom_absolute=100,pan_absolute=0,tilt_absolute=0,power_line_frequency=1; done'
 ExecStart=/usr/local/bin/hoppdelay.py
 Restart=always
 RestartSec=2

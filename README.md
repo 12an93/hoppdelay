@@ -1,28 +1,32 @@
 # Hoppdelay
 
-Fördröjd videouppspelning för simhoppsträning. En kamera filmar svikten, TV:n visar bilden med
-fördröjning (standard 30 s) så att hopparen hinner upp ur bassängen och se sitt hopp. Allt styrs
-från ett tangentbord/presentationsklickare eller från en iPhone via en egen webbsida.
+*[Svenska](README.sv.md)*
 
-## Funktioner
+Delayed video replay for diving practice. A camera films the board and a TV shows the picture with a
+delay (30 s by default), so the diver can climb out of the pool and watch their dive. Everything is
+controlled from a keyboard/presenter clicker or from a phone through a built-in web page. No internet
+or pool network needed: the box runs its own Wi-Fi.
 
-- Fördröjd bild på HDMI, skalas automatiskt till skärmen (max 1080p), liggande eller stående.
-- Hela passet spelas in på disken (upp till 40 % av disken, äldsta minuten raderas först).
-- Spola, pausa, ändra delay och rotera – från tangentbord eller telefon.
-- Repris på telefonen medan TV:n fortsätter: slowmotion (½×, ¼×, ⅒×) och bild för bild.
-- Spara klipp som MP4, byt namn, radera, och spara direkt i Bilder på iPhone.
-- Eget Wi-Fi (hotspot) – kräver inget nät i simhallen.
+## Features
 
-## Hårdvara
+- Delayed picture on HDMI, scaled to any screen (max 1080p), landscape or portrait.
+- The whole session is recorded to disk (up to 40 % of the disk, oldest minute dropped first).
+- Rewind, pause, change the delay and rotate – from the keyboard or the phone.
+- Replay on the phone while the TV keeps running: slow motion (½×, ¼×, ⅒×) and frame by frame.
+- Save clips as MP4, rename, delete, and save straight to Photos on iPhone.
+- Own Wi-Fi hotspot, starts by itself when power is connected.
 
-- Mini-PC med Intel-grafik (testad: ASUS VivoMini VM65) och HDMI till TV.
-- USB-kamera med MJPEG 1080p30 (testad: Jabra PanaCast 20, med Intelligent Zoom avstängt i Jabra Direct).
-- **PanaCast 20 måste anslutas med en USB 2-kabel.** På USB 3 ger den MJPEG bara i 4K.
-- Valfritt: tangentbord eller presentationsklickare med USB-dongel.
+## Hardware
 
-## Installation (Debian 13, utan skrivbord)
+- Mini PC with Intel graphics (tested: ASUS VivoMini VM65) and HDMI to a TV.
+- USB camera with MJPEG 1080p30 (tested: Jabra PanaCast 20 with Intelligent Zoom turned off in Jabra Direct).
+- **The PanaCast 20 must be connected with a USB 2 cable** (e.g. a phone charging cable). On USB 3 it
+  only offers MJPEG in 4K.
+- Optional: keyboard or presenter clicker with a USB dongle.
 
-BIOS: *Restore AC Power Loss → Power On* så att datorn startar när strömmen kopplas in.
+## Install (Debian 13, no desktop)
+
+In the BIOS, set *Restore AC Power Loss → Power On* so the box starts when power is connected.
 
 ```
 sudo sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=0/' /etc/default/grub && sudo update-grub && echo 'FSCKFIX=yes' | sudo tee -a /etc/default/rcS
@@ -30,37 +34,41 @@ sudo apt install -y avahi-daemon openssl iw dnsmasq-base v4l-utils python3-evdev
 sudo install -m755 hoppdelay.py /usr/local/bin/hoppdelay.py && sudo install -m644 hoppdelay.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now hoppdelay
 ```
 
-Har datorn ett skrivbord installerat: `sudo systemctl set-default multi-user.target`.
+If a desktop is installed: `sudo systemctl set-default multi-user.target`.
 
-Kameran anges i `CAM` överst i `hoppdelay.py` och i `hoppdelay.service`. Hitta sökvägen med `ls /dev/v4l/by-id/`.
+The first USB camera is used. To pick another one, set `HOPPDELAY_CAM` in `hoppdelay.service`
+(list cameras with `ls /dev/v4l/by-id/`).
 
-Logg: `sudo journalctl -u hoppdelay -n 30 --no-pager`
+Log: `sudo journalctl -u hoppdelay -n 30 --no-pager`
 
-### Hotspot
+### Wi-Fi hotspot
+
+Choose your own password (at least 8 characters) instead of `change-me-123`:
 
 ```
-sudo nmcli dev wifi hotspot ifname wlp3s0 con-name Hoppdelay ssid Hoppdelay password svikt3meter && sudo nmcli con modify Hoppdelay connection.autoconnect yes connection.autoconnect-priority 100
+sudo nmcli dev wifi hotspot ifname wlp3s0 con-name Hoppdelay ssid Hoppdelay password change-me-123 && sudo nmcli con modify Hoppdelay connection.autoconnect yes connection.autoconnect-priority 100
 ```
 
-Byt lösenord efter behov. Hemma når du datorn via nätverkskabel, eller genom att ansluta till Hoppdelay-nätet.
+The Wi-Fi interface may have another name than `wlp3s0` – check with `nmcli dev`. With the hotspot
+on, reach the box over an Ethernet cable or by joining the Hoppdelay network.
 
 ### iPhone
 
-1. Anslut till Wi-Fi *Hoppdelay* och öppna `http://hoppdelay.local` (eller `http://10.42.0.1`).
-2. Följ rutan överst: hämta certifikatet, installera profilen, slå på *Hoppdelay-CA* under
-   Inställningar → Allmänt → Om → Certifikatinställningar.
-3. Öppna `https://hoppdelay.local` och lägg den på hemskärmen.
+1. Join the *Hoppdelay* Wi-Fi and open `http://hoppdelay.local` (or `http://10.42.0.1`).
+2. Follow the box at the top: download the certificate, install the profile, and enable
+   *Hoppdelay-CA* under Settings → General → About → Certificate Trust Settings.
+3. Open `https://hoppdelay.local` and add it to the Home Screen.
 
-HTTPS behövs för att iPhone ska kunna spara klipp direkt i Bilder. Certifikaten skapas automatiskt i
-`/etc/hoppdelay` vid första start.
+HTTPS is required for iPhone to save clips straight to Photos. The certificates are created in
+`/etc/hoppdelay` on first start, unique to each box.
 
-## Tangentbord
+## Keyboard
 
-| Tangent | Funktion |
+| Key | Action |
 |---|---|
 | ↑ / ↓ | Delay +5 s / −5 s |
-| ← / PageUp | Bakåt 5 s |
-| → / PageDown | Framåt 5 s |
-| Mellanslag / B | Paus / spela |
-| Enter / Esc | Tillbaka till vanlig delay |
-| R | Rotera 90° |
+| ← / PageUp | Back 5 s |
+| → / PageDown | Forward 5 s |
+| Space / B | Pause / play |
+| Enter / Esc | Back to normal delay |
+| R | Rotate 90° |

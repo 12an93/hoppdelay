@@ -12,6 +12,7 @@
 import bisect
 import http.server
 import json
+import os
 import pathlib
 import queue
 import select
@@ -28,7 +29,8 @@ import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst
 
-CAM = "/dev/v4l/by-id/usb-GN_Jabra_A_S_Jabra_PanaCast_20_A9002000849C-0-video-index0"
+# Camera: HOPPDELAY_CAM if set, otherwise the first USB camera.
+CAM = os.environ.get("HOPPDELAY_CAM") or str(next(iter(sorted(pathlib.Path("/dev/v4l/by-id").glob("*-video-index0"))), "/dev/video0"))
 W, H, FPS = 1920, 1080, 30
 REC = pathlib.Path("/var/lib/hoppdelay")
 SEG_S = 60  # one recording file per minute
