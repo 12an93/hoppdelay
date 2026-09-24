@@ -197,6 +197,11 @@ class Camera:
             i = max(bisect.bisect_right(self.times, t) - 1, 0)
             return self.times[i], self.refs[i]
 
+    def fps(self, now):
+        # Frames actually delivered in the last 3 s: drops below 30 in poor light (longer exposure).
+        with self.lock:
+            return (len(self.times) - bisect.bisect_left(self.times, now - 3)) / 3
+
     def span(self, now):
         with self.lock:
             return (now - self.times[0] if self.times else 0.0), (self.times[-1] if self.times else None)
@@ -766,7 +771,9 @@ $('t').oninput=()=>{drag=true;c('seek/'+(-$('t').value))};$('t').onchange=()=>{d
 function f(s){s=Math.floor(s);return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')}
 function u(){fetch('/api/state').then(r=>r.json()).then(s=>{S=s;
  $('h').textContent=s.review?(s.paused?'Paus  ':'')+'−'+f(s.behind):'Delay '+s.delay+' s';
- $('sub').textContent='Inspelat '+f(s.span)+(s.review?' · tryck "Tillbaka" för delay':'');
+ const fps=s.cams.map(k=>Math.round(k.fps)).join(' / ');
+ $('sub').textContent='Inspelat '+f(s.span)+' · kamera '+fps+' fps'+(s.review?' · tryck "Tillbaka" för delay':'')
+  +(s.span>5&&s.cams.some(k=>k.fps<27)?' · kameran ger färre bilder än 30/s, ofta för lite ljus':'');
  $('d').textContent=s.delay+' s';$('p').textContent=s.paused?'▶':'⏸';
  $('t').min=-s.span;if(!drag)$('t').value=-s.behind;
  const two=s.cams.length>1;$('multi').hidden=!two;$('rcamrow').hidden=!two;
@@ -1282,7 +1289,9 @@ while True:
             err, dbg = msg.parse_error()
             raise SystemExit(f"GStreamer error: {err.message} ({dbg})")
 
-    ready, _, _ = select.select(list(kbds.values()), [], [], 1 / FPS)
+    # Wake up three times per camera frame: waiting a whole frame period plus the work of each
+    # round made the loop slower than the camera, so a frame was skipped every second or two.
+    ready, _, _ = select.select(list(kbds.values()), [], [], 1 / (3 * FPS))
     for dev in ready:
         try:
             for ev in dev.read():
@@ -1343,7 +1352,7 @@ while True:
     tv = hits[main][0]
     status = {"delay": state["delay"], "review": review, "paused": paused, "behind": back, "span": span, "tv": tv,
               "layout": layout, "zone": state["zone"], "autosave": state["autosave"], "llm": bool(LLM_URL),
-              "tvrep": bool(tvr), "pose": pose_available(), "cams": [{"idx": c.idx, "w": c.w, "h": c.h, "rot": rot_of(c.idx)} for c in cams]}
+              "tvrep": bool(tvr), "pose": pose_available(), "cams": [{"idx": c.idx, "w": c.w, "h": c.h, "rot": rot_of(c.idx), "fps": round(c.fps(now), 1)} for c in cams]}
 
     if span < back and not review:
         text = f"Buffrar {span:.0f}/{back} s"
