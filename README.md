@@ -36,7 +36,9 @@ or pool network needed: the box runs its own Wi-Fi.
 ## Hardware
 
 - Mini PC with Intel graphics (tested: ASUS VivoMini VM65) and HDMI to a TV.
-- USB camera with MJPEG 1080p30 (tested: Jabra PanaCast 20 with Intelligent Zoom turned off in Jabra Direct).
+- USB camera with MJPEG up to 1080p at 30–60 fps (tested: Jabra PanaCast 20 with Intelligent Zoom turned off in
+  Jabra Direct). The largest size is used, then the highest frame rate up to 60 fps. Autofocus is locked 10 s after
+  start, so it does not hunt when a diver passes.
 - **The PanaCast 20 must be connected with a USB 2 cable** (e.g. a phone charging cable). On USB 3 it
   only offers MJPEG in 4K.
 - Optional: a second USB camera, and a keyboard or presenter clicker with a USB dongle.
@@ -53,7 +55,7 @@ sudo install -m755 hoppdelay.py /usr/local/bin/hoppdelay.py && sudo install -m64
 
 If a desktop is installed: `sudo systemctl set-default multi-user.target`.
 
-Every USB camera with MJPEG up to 1080p30 is used (at most two). To choose, set
+Every USB camera with MJPEG up to 1080p at 30–60 fps is used (at most two). To choose, set
 `HOPPDELAY_CAMS=/dev/v4l/by-id/...,/dev/v4l/by-id/...` in `hoppdelay.service` (list cameras with
 `ls /dev/v4l/by-id/`). Cameras without MJPEG up to 1080p are skipped with a note in the log.
 
@@ -96,8 +98,9 @@ HTTPS is required for iPhone to save clips straight to Photos. The certificates 
 
 Mark **Takeoff** and **Water** (and optionally **Top** and **Opening**) while stepping frame by frame,
 and pick the board height. The numbers come from projectile motion of the centre of mass, assuming it
-drops about the board height from takeoff to entry. At 30 fps one frame is ±0.03 s, which is roughly
-±0.1–0.2 m on the height. A 60 fps camera halves that.
+drops about the board height from takeoff to entry. At 30 fps one frame is ±0.033 s, which is roughly
+±0.1–0.2 m on the height; at 60 fps it is ±0.017 s and half the error. The page shows the camera's real
+frame rate – if it drops below what the camera should give, there is usually too little light.
 
 ## Automatic dives
 

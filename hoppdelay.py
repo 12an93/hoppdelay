@@ -40,7 +40,6 @@ except ImportError:
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst
 
-FPS = 30
 WATERMARK = "@Tolvers2026"  # creator mark on every video and picture made here, intentionally hard-coded
 # Faint GStreamer text in the lower right corner (ARGB colour: about 30 % white).
 WATERMARK_GST = (f'textoverlay text="{WATERMARK}" valignment=bottom halignment=right font-desc="Sans 11" '
@@ -99,18 +98,25 @@ def rot_of(i):
 
 
 # --- Cameras ---------------------------------------------------------------------------------
-def best_mjpeg_size(dev):
-    # Largest MJPEG size up to 1080p that the camera offers at 30 fps, or None.
+def best_mjpeg_mode(dev):
+    # Largest MJPEG size up to 1080p, then the highest frame rate from 30 to 60 fps: (w, h, fps) or None.
     out = subprocess.run(["v4l2-ctl", "-d", dev, "--list-formats-ext"], capture_output=True, text=True).stdout
-    sizes, fmt, size = [], None, None
+    modes, fmt, size = [], None, None
     for line in out.splitlines():
         if m := re.search(r"\[\d+\]: '(\w+)'", line):
             fmt = m.group(1)
         elif m := re.search(r"Size: Discrete (\d+)x(\d+)", line):
             size = (int(m.group(1)), int(m.group(2)))
-        elif fmt == "MJPG" and size and "(30.000 fps)" in line and size[0] <= 1920 and size[1] <= 1080:
-            sizes.append(size)
-    return max(sizes, key=lambda s: s[0] * s[1]) if sizes else None
+        elif (m := re.search(r"\(([\d.]+) fps\)", line)) and fmt == "MJPG" and size and size[0] <= 1920 and size[1] <= 1080:
+            fps = float(m.group(1))
+            if 29 <= fps <= 61:
+                modes.append((*size, fps))
+    return max(modes, key=lambda m: (m[0] * m[1], m[2])) if modes else None
+
+
+def gst_rate(fps):
+    # GStreamer fraction: 60 -> 60/1, 59.94 -> 60000/1001
+    return f"{round(fps)}/1" if abs(fps - round(fps)) < 0.01 else f"{round(fps * 1001)}/1001"
 
 
 def find_cameras():
@@ -119,18 +125,18 @@ def find_cameras():
     devs = env.split(",") if env else [str(p) for p in sorted(pathlib.Path("/dev/v4l/by-id").glob("*-video-index0"))]
     found = []
     for dev in devs:
-        size = best_mjpeg_size(dev.strip())
-        if size:
-            found.append((dev.strip(), *size))
+        mode = best_mjpeg_mode(dev.strip())
+        if mode:
+            found.append((dev.strip(), *mode))
         else:
-            print(f"Skipping {dev}: no MJPEG up to 1080p30 (PanaCast 20: use a USB 2 cable)", flush=True)
+            print(f"Skipping {dev}: no MJPEG up to 1080p at 30-60 fps (PanaCast 20: use a USB 2 cable)", flush=True)
     return found[:2]
 
 
 class Camera:
     # One USB camera: JPEG frames appended to one file per minute, index in memory.
-    def __init__(self, idx, dev, w, h, max_disk):
-        self.idx, self.dev, self.w, self.h, self.max_disk = idx, dev, w, h, max_disk
+    def __init__(self, idx, dev, w, h, fps, max_disk):
+        self.idx, self.dev, self.w, self.h, self.fps, self.max_disk = idx, dev, w, h, fps, max_disk
         self.dir = REC / f"cam{idx}"
         self.dir.mkdir(parents=True, exist_ok=True)
         for f in self.dir.glob("*.mjpg"):  # the index lives in memory, so old files are unusable
@@ -140,12 +146,19 @@ class Camera:
         self.lock = threading.Lock()
         self.listeners = []  # called with (time, jpeg) for every frame, e.g. the motion detector
         self.pipe = Gst.parse_launch(
-            f"v4l2src device={dev} ! image/jpeg,width={w},height={h},framerate={FPS}/1 ! "
+            f"v4l2src device={dev} ! image/jpeg,width={w},height={h},framerate={gst_rate(fps)} ! "
             "appsink name=sink emit-signals=true max-buffers=2 drop=true sync=false")
         self.pipe.get_by_name("sink").connect("new-sample", self.on_frame)
 
     def start(self):
         self.pipe.set_state(Gst.State.PLAYING)
+        threading.Timer(10, self.lock_focus).start()
+
+    def lock_focus(self):
+        # Autofocus hunts when a diver passes. Let it focus on the scene for 10 s, then keep that focus
+        # (the camera does not move). Cameras without these controls just ignore it.
+        for ctrl in ("focus_automatic_continuous=0", "focus_auto=0"):
+            subprocess.run(["v4l2-ctl", "-d", self.dev, "-c", ctrl], capture_output=True)
 
     def seg_path(self, n):
         return self.dir / f"{n:06d}.mjpg"
@@ -197,7 +210,7 @@ class Camera:
             i = max(bisect.bisect_right(self.times, t) - 1, 0)
             return self.times[i], self.refs[i]
 
-    def fps(self, now):
+    def measured_fps(self, now):
         # Frames actually delivered in the last 3 s: drops below 30 in poor light (longer exposure).
         with self.lock:
             return (len(self.times) - bisect.bisect_left(self.times, now - 3)) / 3
@@ -212,7 +225,7 @@ def save_clip(cam, t0, t1, rot, name):
     ts, rs = cam.between(t0, t1)
     tmp = CLIPS / (name + ".part")
     p = Gst.parse_launch(
-        f"appsrc name=src format=time block=true caps=image/jpeg,width={cam.w},height={cam.h},framerate={FPS}/1 ! "
+        f"appsrc name=src format=time block=true caps=image/jpeg,width={cam.w},height={cam.h},framerate={gst_rate(cam.fps)} ! "
         f"jpegparse ! {DECODER} ! videoflip method={rot} ! videoconvert ! {WATERMARK_GST} ! videoconvert ! video/x-raw,format=NV12 ! "
         f"{ENCODER} ! h264parse ! mp4mux ! filesink name=sink"
     )
@@ -225,7 +238,7 @@ def save_clip(cam, t0, t1, rot, name):
         except FileNotFoundError:
             continue
         buf.pts = int((t - ts[0]) * Gst.SECOND)
-        buf.duration = Gst.SECOND // FPS
+        buf.duration = int(Gst.SECOND / cam.fps)
         src.emit("push-buffer", buf)
     src.emit("end-of-stream")
     msg = p.get_bus().timed_pop_filtered(Gst.CLOCK_TIME_NONE, Gst.MessageType.EOS | Gst.MessageType.ERROR)
@@ -499,7 +512,7 @@ class Detector(threading.Thread):
         if state.get("autosave"):
             def later():  # wait until the end of the clip has been recorded
                 time.sleep(max(0.0, t1 + 0.3 - time.monotonic()))
-                new_clip(self.cam, t0, t1, rot_of(self.cam.idx), "Auto", {"board": 3.0, "marks": {}, "cam": self.cam.idx})
+                new_clip(self.cam, t0, t1, rot_of(self.cam.idx), "Auto", {"board": 3.0, "marks": {}, "cam": self.cam.idx, "fps": self.cam.fps})
             threading.Thread(target=later, daemon=True).start()
 
 
@@ -535,7 +548,7 @@ def screen_size():
 def display_jpeg(cam, rot, sw, sh, conn):
     # One camera full screen: JPEG decoded by the GPU, scaled with black borders, text on top.
     p = Gst.parse_launch(
-        f"appsrc name=src is-live=true max-buffers=1 leaky-type=downstream do-timestamp=true format=time caps=image/jpeg,width={cam.w},height={cam.h},framerate={FPS}/1 ! "
+        f"appsrc name=src is-live=true max-buffers=1 leaky-type=downstream do-timestamp=true format=time caps=image/jpeg,width={cam.w},height={cam.h},framerate={gst_rate(cam.fps)} ! "
         f"jpegparse ! {DECODER} ! videoflip method={rot} ! videoconvert ! "
         f"videoscale add-borders=true ! video/x-raw,width={sw},height={sh},pixel-aspect-ratio=1/1 ! "
         'textoverlay name=txt valignment=top halignment=left font-desc="Sans 20" ! '
@@ -546,11 +559,11 @@ def display_jpeg(cam, rot, sw, sh, conn):
     return p, p.get_by_name("src"), p.get_by_name("txt")
 
 
-def display_raw(sw, sh, conn):
+def display_raw(sw, sh, conn, fps):
     # Picture composed in Python (split screen, picture in picture, TV replay).
     p = Gst.parse_launch(
         f"appsrc name=src is-live=true max-buffers=1 leaky-type=downstream do-timestamp=true format=time "
-        f"caps=video/x-raw,format=BGR,width={sw},height={sh},framerate={FPS}/1 ! "
+        f"caps=video/x-raw,format=BGR,width={sw},height={sh},framerate={gst_rate(fps)} ! "
         f"videoconvert ! kmssink sync=false force-modesetting=true connector-id={conn}"
     )
     p.set_state(Gst.State.PLAYING)
@@ -773,7 +786,7 @@ function u(){fetch('/api/state').then(r=>r.json()).then(s=>{S=s;
  $('h').textContent=s.review?(s.paused?'Paus  ':'')+'−'+f(s.behind):'Delay '+s.delay+' s';
  const fps=s.cams.map(k=>Math.round(k.fps)).join(' / ');
  $('sub').textContent='Inspelat '+f(s.span)+' · kamera '+fps+' fps'+(s.review?' · tryck "Tillbaka" för delay':'')
-  +(s.span>5&&s.cams.some(k=>k.fps<27)?' · kameran ger färre bilder än 30/s, ofta för lite ljus':'');
+  +(s.span>5&&s.cams.some(k=>k.fps<k.nominal*0.9)?' · kameran ger färre bilder än den ska, ofta för lite ljus':'');
  $('d').textContent=s.delay+' s';$('p').textContent=s.paused?'▶':'⏸';
  $('t').min=-s.span;if(!drag)$('t').value=-s.behind;
  const two=s.cams.length>1;$('multi').hidden=!two;$('rcamrow').hidden=!two;
@@ -796,12 +809,12 @@ function phys(m,H){
  if(m.apex!=null&&m.apex>m.takeoff)r.riseApex=G*(m.apex-m.takeoff)**2/2;
  if(m.open!=null&&m.open>m.takeoff){const to=m.open-m.takeoff;r.to=to;r.openH=H+v*to-G*to*to/2;}
  return r;}
-function physText(m,H){const r=phys(m,H);
+function physText(m,H,fps){const r=phys(m,H);
  if(!r)return 'Markera minst <b>Upphopp</b> och <b>Vatten</b> (stega bild för bild).';
  let s='Flygtid <b>'+num(r.T,2)+' s</b><br>Högsta punkt <b>'+num(r.rise,2)+' m</b> över upphoppet, efter '+num(r.ta,2)+' s';
  if(r.riseApex!=null)s+='<br>Enligt toppmarkeringen: '+num(r.riseApex,2)+' m';
  if(r.to!=null)s+='<br>Öppning efter '+num(r.to,2)+' s, <b>'+num(r.openH,1)+' m</b> över vattnet';
- return s+'<br><small>±1 bild ≈ ±0,03 s. Räknat på att tyngdpunkten faller lika mycket som svikthöjden.</small>';}
+ return s+'<br><small>±1 bild ≈ ±'+num(1/(fps||30),3)+' s. Räknat på att tyngdpunkten faller lika mycket som svikthöjden.</small>';}
 
 // ---- Drawing tools (line, angle, calibration) -------------------------------------------
 let SCALE=parseFloat(store('hd_scale'))||null; // metres per pixel, shared: the camera does not move
@@ -843,12 +856,12 @@ function zoneOff(){fetch('/api/zone',{method:'POST',headers:{'Content-Type':'app
 const rawToView=(x,y,rot)=>({none:[x,y],clockwise:[1-y,x],'rotate-180':[1-x,1-y],counterclockwise:[y,1-x]}[rot]);
 $('board').value=store('hd_board')||'3';
 $('board').onchange=()=>{store('hd_board',$('board').value);showPhys();};
-function showPhys(){if(R)$('phys').innerHTML=physText(R.marks,+$('board').value);}
+function showPhys(){if(R)$('phys').innerHTML=physText(R.marks,+$('board').value,R.fps);}
 function grab(){loadReplay(+$('rcam').value||0,S.tv-$('len').value,S.tv);}
 async function loadReplay(cam,t0,t1){
  const r=await(await fetch('/api/range/'+cam+'/'+t0+'/'+t1)).json();
  if(!r.times.length){$('rp').hidden=false;$('info').textContent='Inget inspelat i det intervallet ännu';return;}
- const k={cam,times:r.times,blobs:[],bm:new Map(),rot:S.cams[cam].rot,i:0,playing:false,speed:1,pos:0,marks:{},track:null,pose:null};
+ const k={cam,fps:S.cams[cam].nominal||30,times:r.times,blobs:[],bm:new Map(),rot:S.cams[cam].rot,i:0,playing:false,speed:1,pos:0,marks:{},track:null,pose:null};
  ['stroimg','strotip','trk','fb','pose'].forEach(id=>$(id).hidden=true);
  R=k;$('rp').hidden=false;$('rs').max=k.times.length-1;setSpeed(1);$('pl').textContent='▶︎';showPhys();
  A1.items=[];A1.pts=[];$('mk').querySelectorAll('button').forEach(x=>x.classList.remove('on')); // new dive: fresh marks and drawings
@@ -873,11 +886,11 @@ async function draw(){const k=R,n=k&&k.i;if(!k||!k.blobs[n])return;
   x.beginPath();tr.forEach((p,j)=>j?x.lineTo(p.x,p.y):x.moveTo(p.x,p.y));x.stroke();
   const ap=tr.reduce((a,b)=>b.y<a.y?b:a);x.beginPath();x.arc(ap.x,ap.y,lw*4,0,7);x.stroke();
   const cur=tr.reduce((a,b)=>Math.abs(b.t-now)<Math.abs(a.t-now)?b:a);
-  if(Math.abs(cur.t-now)<0.05){x.beginPath();x.arc(cur.x,cur.y,lw*3,0,7);x.fill();
+  if(Math.abs(cur.t-now)<0.6/k.fps){x.beginPath();x.arc(cur.x,cur.y,lw*3,0,7);x.fill();
    const r=lw*30,ang=cur.angle*Math.PI/180;x.beginPath();x.moveTo(cur.x-r*Math.cos(ang),cur.y-r*Math.sin(ang));x.lineTo(cur.x+r*Math.cos(ang),cur.y+r*Math.sin(ang));x.stroke();}
   x.restore();}
  if(k.pose){const now=k.times[n],f=k.pose.reduce((a,b)=>Math.abs(b.t-now)<Math.abs(a.t-now)?b:a);
-  if(Math.abs(f.t-now)<0.02){const lw=Math.max(2,w/300);x.save();x.strokeStyle=x.fillStyle='#ff7b72';x.lineWidth=lw;
+  if(Math.abs(f.t-now)<0.6/k.fps){const lw=Math.max(2,w/300);x.save();x.strokeStyle=x.fillStyle='#ff7b72';x.lineWidth=lw;
    for(const[a,b]of EDGES){const p=f.kp[a],q=f.kp[b];if(p[2]>0.3&&q[2]>0.3){x.beginPath();x.moveTo(p[0],p[1]);x.lineTo(q[0],q[1]);x.stroke();}}
    f.kp.forEach(p=>{if(p[2]>0.3){x.beginPath();x.arc(p[0],p[1],lw*1.5,0,7);x.fill();}});
    if(f.hip!=null){const hp=f.kp[11][2]>f.kp[12][2]?f.kp[11]:f.kp[12];x.font='bold '+Math.round(w/40)+'px sans-serif';
@@ -999,14 +1012,15 @@ async function cLoad(){const a=$('ca').value,b=$('cb').value;if(!a||!b)return;$(
  await Promise.all([A,B].map(v=>new Promise(res=>{if(v.readyState>=2)return res();v.addEventListener('loadeddata',res,{once:true});})));
  A.pause();B.pause();
  const mark=n=>((CL[n]||{}).meta||{}).marks||{};
- Object.assign(C,{A,B,ma:mark(a).takeoff||0,mb:mark(b).takeoff||0,shift:0,playing:false,names:[a,b]});
+ const rate=n=>((CL[n]||{}).meta||{}).fps||30;
+ Object.assign(C,{A,B,ma:mark(a).takeoff||0,mb:mark(b).takeoff||0,fa:rate(a),fb:rate(b),shift:0,playing:false,names:[a,b]});
  C.p=-Math.max(C.ma,C.mb);$('cpl').textContent='▶︎';cRender();}
 const cRange=()=>[-Math.max(C.ma,C.mb),Math.max(C.A.duration-C.ma,C.B.duration-C.mb)];
 const clampT=(v,t)=>Math.min(Math.max(t,0),Math.max(v.duration-0.001,0));
 function seek(v,t){return new Promise(res=>{if(Math.abs(v.currentTime-t)<0.0005)return res();v.addEventListener('seeked',res,{once:true});v.currentTime=t;});}
 async function cRender(){if(!C.A)return;if(C.busy){C.dirty=true;return;}C.busy=true;
- const mid=0.5/30; // aim at the middle of a frame, not its edge
- do{C.dirty=false;await Promise.all([seek(C.A,clampT(C.A,C.ma+C.p+mid)),seek(C.B,clampT(C.B,C.mb+C.p+C.shift/30+mid))]);drawC();}while(C.dirty);
+ // aim at the middle of a frame, not its edge
+ do{C.dirty=false;await Promise.all([seek(C.A,clampT(C.A,C.ma+C.p+0.5/C.fa)),seek(C.B,clampT(C.B,C.mb+C.p+(C.shift+0.5)/C.fb))]);drawC();}while(C.dirty);
  C.busy=false;}
 function drawC(){if(!C.A)return;const{A,B}=C,w=A.videoWidth,h=A.videoHeight,side=C.mode==='side',cc=$('cc');
  const W=side?w*2:w;if(cc.width!==W||cc.height!==h){cc.width=W;cc.height=h;}
@@ -1019,7 +1033,7 @@ function drawC(){if(!C.A)return;const{A,B}=C,w=A.videoWidth,h=A.videoHeight,side
  const info=n=>{const m=(CL[n]||{}).meta;const r=m&&phys(m.marks||{},m.board||3);return r?'flygtid '+num(r.T,2)+' s, topp '+num(r.rise,2)+' m':'ej mätt';};
  $('cinfo').innerHTML=(C.p>=0?'+':'')+num(C.p,2)+' s från upphopp · B '+(C.shift>=0?'+':'')+C.shift+' bild · '+C.speed+'×'
   +'<br>A: '+esc(C.names[0])+' – '+info(C.names[0])+'<br>B: '+esc(C.names[1])+' – '+info(C.names[1]);}
-function cStep(d){if(!C.A)return;C.playing=false;$('cpl').textContent='▶︎';C.p+=d/30;cRender();}
+function cStep(d){if(!C.A)return;C.playing=false;$('cpl').textContent='▶︎';C.p+=d/C.fa;cRender();}
 function cShift(d){if(!C.A)return;C.shift+=d;cRender();}
 function cPlay(){if(!C.A)return;C.playing=!C.playing;$('cpl').textContent=C.playing?'⏸':'▶︎';}
 speedButtons($('csp'),v=>{C.speed=v;markSpeed($('csp'),v);if(C.A)drawC();});
@@ -1131,7 +1145,7 @@ class Web(http.server.BaseHTTPRequestHandler):
                 if not 0 < t1 - t0 <= MAX_CLIP_S or rot not in ROTATIONS:
                     return self.reply(400, b"", "text/plain")
                 base = clean_name(str(body.get("name", ""))).removesuffix(".mp4") or "hopp"
-                meta = {**clean_meta(body.get("meta") or {}), "cam": cam.idx}
+                meta = {**clean_meta(body.get("meta") or {}), "cam": cam.idx, "fps": cam.fps}
                 name = new_clip(cam, t0, t1, rot, base, meta)
                 return self.reply(202, json.dumps({"name": name}).encode(), "application/json")
             if parts == ["api", "zone"]:
@@ -1244,8 +1258,8 @@ for f in CLIPS.glob("*.part"):  # unfinished saves
     f.unlink()
 found = find_cameras()
 if not found:
-    raise SystemExit("No camera with MJPEG up to 1080p30 found")
-cams = [Camera(i, dev, w, h, MAX_DISK // len(found)) for i, (dev, w, h) in enumerate(found)]
+    raise SystemExit("No camera with MJPEG up to 1080p at 30-60 fps found")
+cams = [Camera(i, dev, w, h, fps, MAX_DISK // len(found)) for i, (dev, w, h, fps) in enumerate(found)]
 detector = Detector(cams[0])
 detector.start()
 for c in cams:
@@ -1291,7 +1305,7 @@ while True:
 
     # Wake up three times per camera frame: waiting a whole frame period plus the work of each
     # round made the loop slower than the camera, so a frame was skipped every second or two.
-    ready, _, _ = select.select(list(kbds.values()), [], [], 1 / (3 * FPS))
+    ready, _, _ = select.select(list(kbds.values()), [], [], 1 / (3 * max(c.fps for c in cams)))
     for dev in ready:
         try:
             for ev in dev.read():
@@ -1339,7 +1353,7 @@ while True:
     if want != disp_key:
         if disp:
             disp.set_state(Gst.State.NULL)
-        disp, src, txt = display_jpeg(cams[main], rot_of(main), *screen) if mode == "jpeg" else display_raw(*screen)
+        disp, src, txt = display_jpeg(cams[main], rot_of(main), *screen) if mode == "jpeg" else display_raw(*screen, max(c.fps for c in cams))
         disp_key, shown_key = want, None
 
     hits = {i: cams[i].at(now - back) for i in visible}
@@ -1352,7 +1366,7 @@ while True:
     tv = hits[main][0]
     status = {"delay": state["delay"], "review": review, "paused": paused, "behind": back, "span": span, "tv": tv,
               "layout": layout, "zone": state["zone"], "autosave": state["autosave"], "llm": bool(LLM_URL),
-              "tvrep": bool(tvr), "pose": pose_available(), "cams": [{"idx": c.idx, "w": c.w, "h": c.h, "rot": rot_of(c.idx), "fps": round(c.fps(now), 1)} for c in cams]}
+              "tvrep": bool(tvr), "pose": pose_available(), "cams": [{"idx": c.idx, "w": c.w, "h": c.h, "rot": rot_of(c.idx), "fps": round(c.measured_fps(now), 1), "nominal": c.fps} for c in cams]}
 
     if span < back and not review:
         text = f"Buffrar {span:.0f}/{back} s"
