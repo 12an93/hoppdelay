@@ -9,6 +9,8 @@ or pool network needed: the box runs its own Wi-Fi.
 
 ## Features
 
+- The first 60 s after start the TV shows the live picture, so the camera can be pointed; then the delay
+  starts. The same live mode is one tap away later (autofocus is free while adjusting, locked after).
 - Delayed picture on HDMI, scaled to any screen (max 1080p), landscape or portrait.
 - The whole session is recorded to disk (up to 40 % of the disk, oldest minute dropped first).
 - Rewind, pause, change the delay and rotate – from the keyboard or the phone.
@@ -38,8 +40,8 @@ or pool network needed: the box runs its own Wi-Fi.
 - Mini PC with Intel graphics (tested: ASUS VivoMini VM65) and HDMI to a TV.
 - USB camera with MJPEG up to 1080p at 30–60 fps (tested: Jabra PanaCast 20 with Intelligent Zoom turned off in
   Jabra Direct). The largest size is used, then the highest frame rate up to 60 fps
-  (cameras that only offer 90 or 120 fps, like some global shutter cameras, run at that). Autofocus is locked 10 s after
-  start, so it does not hunt when a diver passes.
+  (cameras that only offer 90 or 120 fps, like some global shutter cameras, run at that). Autofocus is locked when the live
+  setup ends, so it does not hunt when a diver passes.
 - **The PanaCast 20 must be connected with a USB 2 cable** (e.g. a phone charging cable). On USB 3 it
   only offers MJPEG in 4K.
 - Optional: a second USB camera, and a keyboard or presenter clicker with a USB dongle.
@@ -94,6 +96,7 @@ HTTPS is required for iPhone to save clips straight to Photos. The certificates 
 | Enter / Esc | Back to normal delay |
 | R | Rotate camera 1 by 90° |
 | L | Next TV layout (two cameras) |
+| S | Live picture to adjust the camera / done |
 
 ## Measurements
 

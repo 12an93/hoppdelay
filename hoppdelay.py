@@ -11,6 +11,7 @@
 #   Enter / Esc         back to normal delay
 #   R                   rotate camera 1 by 90 degrees
 #   L                   next TV layout (with two cameras)
+#   S                   live picture to adjust the camera / done (also the first 60 s after start)
 import bisect
 import http.server
 import json
@@ -52,6 +53,7 @@ SEG_S = 60  # one recording file per minute
 MAX_DISK = shutil.disk_usage("/").total * 4 // 10  # recordings may use 40 % of the disk (shared by the cameras)
 MAX_CLIP_S = 120
 STEP_S = 5
+SETUP_S = 60  # live picture after start (and on request) to point the camera; then the delay starts
 ROTATIONS = ["none", "clockwise", "rotate-180", "counterclockwise"]
 LAYOUTS = ["cam0", "cam1", "split", "pip"]
 # Automatic clips: motion in the zone starts an event; the clip gets some time before and after.
@@ -70,9 +72,9 @@ KEYMAP = {  # key -> command (same commands as the web page)
     E.KEY_RIGHT: ("step", STEP_S), E.KEY_PAGEDOWN: ("step", STEP_S),
     E.KEY_SPACE: ("pause", 0), E.KEY_B: ("pause", 0),
     E.KEY_ENTER: ("live", 0), E.KEY_ESC: ("live", 0),
-    E.KEY_R: ("rotate", 0), E.KEY_L: ("layout_next", 0),
+    E.KEY_R: ("rotate", 0), E.KEY_L: ("layout_next", 0), E.KEY_S: ("setup_toggle", 0),
 }
-COMMANDS = {"delay_by", "step", "seek", "pause", "live", "rotate", "layout", "layout_next", "autosave"}
+COMMANDS = {"delay_by", "step", "seek", "pause", "live", "rotate", "layout", "layout_next", "autosave", "setup_toggle"}
 
 Gst.init(None)
 DECODER = "vajpegdec" if Gst.ElementFactory.find("vajpegdec") else "jpegdec"  # Intel GPU decode if available
@@ -153,13 +155,13 @@ class Camera:
 
     def start(self):
         self.pipe.set_state(Gst.State.PLAYING)
-        threading.Timer(10, self.lock_focus).start()
+        self.set_autofocus(True)
 
-    def lock_focus(self):
-        # Autofocus hunts when a diver passes. Let it focus on the scene for 10 s, then keep that focus
-        # (the camera does not move). Cameras without these controls just ignore it.
-        for ctrl in ("focus_automatic_continuous=0", "focus_auto=0"):
-            subprocess.run(["v4l2-ctl", "-d", self.dev, "-c", ctrl], capture_output=True)
+    def set_autofocus(self, on):
+        # Autofocus is on while the camera is being pointed (setup) and locked afterwards, so it does not
+        # hunt when a diver passes. Cameras without these controls just ignore it.
+        for ctrl in ("focus_automatic_continuous", "focus_auto"):
+            subprocess.run(["v4l2-ctl", "-d", self.dev, "-c", f"{ctrl}={int(on)}"], capture_output=True)
 
     def seg_path(self, n):
         return self.dir / f"{n:06d}.mjpg"
@@ -711,6 +713,7 @@ a{color:#58a6ff}#tls{background:#1c2a3a;border-radius:12px;padding:12px 14px;mar
 <button class="big" onclick="c('live')">Tillbaka till delay</button>
 <label>Delay</label>
 <div class="row"><button onclick="c('delay_by/-5')">−5</button><div id="d"></div><button onclick="c('delay_by/5')">+5</button></div>
+<div class="row"><button id="setupb" onclick="c('setup_toggle')">Live-läge (justera kamera)</button></div>
 <div class="row" id="rots"></div>
 <div id="multi" hidden><label>TV-layout</label>
 <div class="row tools" id="lay"><button data-l="0">Kamera 1</button><button data-l="1">Kamera 2</button>
@@ -784,7 +787,8 @@ function c(x){fetch('/api/'+x,{method:'POST'}).then(u)}
 $('t').oninput=()=>{drag=true;c('seek/'+(-$('t').value))};$('t').onchange=()=>{drag=false};
 function f(s){s=Math.floor(s);return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')}
 function u(){fetch('/api/state').then(r=>r.json()).then(s=>{S=s;
- $('h').textContent=s.review?(s.paused?'Paus  ':'')+'−'+f(s.behind):'Delay '+s.delay+' s';
+ $('h').textContent=s.setup?'Live – justera kameran':s.review?(s.paused?'Paus  ':'')+'−'+f(s.behind):'Delay '+s.delay+' s';
+ $('setupb').textContent=s.setup?'Klar – starta delay ('+s.setup+' s)':'Live-läge (justera kamera)';$('setupb').classList.toggle('on',!!s.setup);
  const fps=s.cams.map(k=>Math.round(k.fps)).join(' / ');
  $('sub').textContent='Inspelat '+f(s.span)+' · kamera '+fps+' fps'+(s.review?' · tryck "Tillbaka" för delay':'')
   +(s.span>5&&s.cams.some(k=>k.fps<k.nominal*0.9)?' · kameran ger färre bilder än den ska, ofta för lite ljus':'');
@@ -1281,6 +1285,7 @@ for server in (http.server.ThreadingHTTPServer(("", 80), Web), https):
 screen = screen_size()
 disp, src, txt, disp_key = None, None, None, None
 start = last = time.monotonic()
+setup_until, in_setup = start + SETUP_S, True  # live picture first, to point the camera
 review, paused, behind = False, False, 0.0  # review: rewound/paused, showing `behind` seconds back
 shown_key = None
 kbds, next_scan = {}, 0.0
@@ -1329,6 +1334,9 @@ while True:
             state["layout"] = LAYOUTS[int(v)]
         elif cmd == "layout_next":
             state["layout"] = LAYOUTS[(LAYOUTS.index(state["layout"]) + 1) % len(LAYOUTS)]
+        elif cmd == "setup_toggle":
+            setup_until = now if now < setup_until else now + SETUP_S
+            review = paused = False
         elif cmd == "autosave":
             state["autosave"] = bool(v)
         elif cmd in ("step", "seek", "pause"):  # enter review mode
@@ -1344,7 +1352,10 @@ while True:
 
     if paused:
         behind = min(behind + dt, span)  # frozen frame; stays inside the recording
-    back = behind if review else state["delay"]
+    if (now < setup_until) != in_setup:  # setup started or ended: focus freely, or lock the focus
+        in_setup = now < setup_until
+        threading.Thread(target=lambda on=in_setup: [c.set_autofocus(on) for c in cams], daemon=True).start()
+    back = behind if review else (0.0 if in_setup else state["delay"])
     layout = state["layout"] if len(cams) == 2 else "cam0"
     visible = {"cam0": [0], "cam1": [1], "split": [0, 1], "pip": [0, 1]}[layout]
     main = visible[0]
@@ -1367,9 +1378,12 @@ while True:
     tv = hits[main][0]
     status = {"delay": state["delay"], "review": review, "paused": paused, "behind": back, "span": span, "tv": tv,
               "layout": layout, "zone": state["zone"], "autosave": state["autosave"], "llm": bool(LLM_URL),
-              "tvrep": bool(tvr), "pose": pose_available(), "cams": [{"idx": c.idx, "w": c.w, "h": c.h, "rot": rot_of(c.idx), "fps": round(c.measured_fps(now), 1), "nominal": c.fps} for c in cams]}
+              "tvrep": bool(tvr), "pose": pose_available(),
+              "setup": round(max(0.0, setup_until - now)) if not review else 0, "cams": [{"idx": c.idx, "w": c.w, "h": c.h, "rot": rot_of(c.idx), "fps": round(c.measured_fps(now), 1), "nominal": c.fps} for c in cams]}
 
-    if span < back and not review:
+    if in_setup and not review:
+        text = f"Live – justera kameran   delay startar om {int(setup_until - now) + 1} s   (S = klar)"
+    elif span < back and not review:
         text = f"Buffrar {span:.0f}/{back} s"
     elif review:
         text = f"{'Paus  ' if paused else ''}-{mmss(back)}   (Enter = tillbaka till {state['delay']} s)"
