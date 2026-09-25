@@ -99,7 +99,8 @@ def rot_of(i):
 
 # --- Cameras ---------------------------------------------------------------------------------
 def best_mjpeg_mode(dev):
-    # Largest MJPEG size up to 1080p, then the highest frame rate from 30 to 60 fps: (w, h, fps) or None.
+    # Largest MJPEG size up to 1080p, then the highest frame rate up to 60 fps. Cameras that only offer
+    # more (some global shutter cameras list just 90 or 120 fps) get their lowest rate. (w, h, fps) or None.
     out = subprocess.run(["v4l2-ctl", "-d", dev, "--list-formats-ext"], capture_output=True, text=True).stdout
     modes, fmt, size = [], None, None
     for line in out.splitlines():
@@ -109,9 +110,9 @@ def best_mjpeg_mode(dev):
             size = (int(m.group(1)), int(m.group(2)))
         elif (m := re.search(r"\(([\d.]+) fps\)", line)) and fmt == "MJPG" and size and size[0] <= 1920 and size[1] <= 1080:
             fps = float(m.group(1))
-            if 29 <= fps <= 61:
+            if 29 <= fps <= 125:
                 modes.append((*size, fps))
-    return max(modes, key=lambda m: (m[0] * m[1], m[2])) if modes else None
+    return max(modes, key=lambda m: (m[0] * m[1], m[2] if m[2] <= 61 else -m[2])) if modes else None
 
 
 def gst_rate(fps):
@@ -129,7 +130,7 @@ def find_cameras():
         if mode:
             found.append((dev.strip(), *mode))
         else:
-            print(f"Skipping {dev}: no MJPEG up to 1080p at 30-60 fps (PanaCast 20: use a USB 2 cable)", flush=True)
+            print(f"Skipping {dev}: no MJPEG up to 1080p at 30 fps or more (PanaCast 20: use a USB 2 cable)", flush=True)
     return found[:2]
 
 
@@ -1258,7 +1259,7 @@ for f in CLIPS.glob("*.part"):  # unfinished saves
     f.unlink()
 found = find_cameras()
 if not found:
-    raise SystemExit("No camera with MJPEG up to 1080p at 30-60 fps found")
+    raise SystemExit("No camera with MJPEG up to 1080p at 30 fps or more found")
 cams = [Camera(i, dev, w, h, fps, MAX_DISK // len(found)) for i, (dev, w, h, fps) in enumerate(found)]
 detector = Detector(cams[0])
 detector.start()

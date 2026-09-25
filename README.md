@@ -37,7 +37,8 @@ or pool network needed: the box runs its own Wi-Fi.
 
 - Mini PC with Intel graphics (tested: ASUS VivoMini VM65) and HDMI to a TV.
 - USB camera with MJPEG up to 1080p at 30–60 fps (tested: Jabra PanaCast 20 with Intelligent Zoom turned off in
-  Jabra Direct). The largest size is used, then the highest frame rate up to 60 fps. Autofocus is locked 10 s after
+  Jabra Direct). The largest size is used, then the highest frame rate up to 60 fps
+  (cameras that only offer 90 or 120 fps, like some global shutter cameras, run at that). Autofocus is locked 10 s after
   start, so it does not hunt when a diver passes.
 - **The PanaCast 20 must be connected with a USB 2 cable** (e.g. a phone charging cable). On USB 3 it
   only offers MJPEG in 4K.
@@ -55,7 +56,7 @@ sudo install -m755 hoppdelay.py /usr/local/bin/hoppdelay.py && sudo install -m64
 
 If a desktop is installed: `sudo systemctl set-default multi-user.target`.
 
-Every USB camera with MJPEG up to 1080p at 30–60 fps is used (at most two). To choose, set
+Every USB camera with MJPEG up to 1080p at 30 fps or more is used (at most two). To choose, set
 `HOPPDELAY_CAMS=/dev/v4l/by-id/...,/dev/v4l/by-id/...` in `hoppdelay.service` (list cameras with
 `ls /dev/v4l/by-id/`). Cameras without MJPEG up to 1080p are skipped with a note in the log.
 
