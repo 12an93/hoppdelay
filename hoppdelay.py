@@ -13,6 +13,7 @@
 #   L                   next TV layout (with two cameras)
 #   S                   live picture to adjust the camera / done (also the first 60 s after start)
 import bisect
+import collections
 import http.server
 import json
 import os
@@ -556,7 +557,7 @@ def display_jpeg(cam, rot, sw, sh, conn):
         f"videoscale add-borders=true ! video/x-raw,width={sw},height={sh},pixel-aspect-ratio=1/1 ! "
         'textoverlay name=txt valignment=top halignment=left font-desc="Sans 20" ! '
         f"{WATERMARK_GST} ! "
-        f"videoconvert ! kmssink sync=false force-modesetting=true connector-id={conn}"
+        f"videoconvert ! kmssink name=tv sync=false force-modesetting=true connector-id={conn}"
     )
     p.set_state(Gst.State.PLAYING)
     return p, p.get_by_name("src"), p.get_by_name("txt")
@@ -567,7 +568,7 @@ def display_raw(sw, sh, conn, fps):
     p = Gst.parse_launch(
         f"appsrc name=src is-live=true max-buffers=1 leaky-type=downstream do-timestamp=true format=time "
         f"caps=video/x-raw,format=BGR,width={sw},height={sh},framerate={gst_rate(fps)} ! "
-        f"videoconvert ! kmssink sync=false force-modesetting=true connector-id={conn}"
+        f"videoconvert ! kmssink name=tv sync=false force-modesetting=true connector-id={conn}"
     )
     p.set_state(Gst.State.PLAYING)
     return p, p.get_by_name("src"), None
@@ -1091,6 +1092,8 @@ class Web(http.server.BaseHTTPRequestHandler):
         try:
             if parts == ["api", "state"]:
                 return self.reply(200, json.dumps(status).encode(), "application/json")
+            if parts == ["api", "diag"]:
+                return self.reply(200, json.dumps(diagnostics(), indent=1).encode(), "application/json")
             if parts == ["api", "events"]:
                 with detector.lock:
                     return self.reply(200, json.dumps(detector.events[::-1]).encode(), "application/json")
@@ -1229,6 +1232,40 @@ class Web(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def diagnostics():
+    # Where do frames get lost? Camera -> recording, main loop -> TV. Last 30 s.
+    now = time.monotonic()
+    out = {"decoder": DECODER, "encoder": ENCODER, "load": os.getloadavg(), "cams": [], "tv": {}}
+    for c in cams:
+        with c.lock:
+            ts = c.times[bisect.bisect_left(c.times, now - 30):]
+        gaps = [b - a for a, b in zip(ts, ts[1:])]
+        out["cams"].append({"cam": c.idx + 1, "fps_set": c.fps, "frames_30s": len(ts), "expected": round(c.fps * 30),
+                            "gaps_over_1.5_frames": sum(g > 1.5 / c.fps for g in gaps),
+                            "max_gap_ms": round(max(gaps, default=0) * 1000)})
+    pushes = [d for d in list(diag_pushes) if d[0] > now - 30]
+    loops = [d for d in list(diag_loops) if d[0] > now - 30]
+    fps = cams[0].fps
+    iv = sorted(b[0] - a[0] for a, b in zip(pushes, pushes[1:]) if 0 < b[1] - a[1] < 1)
+    # steps between the frames shown; jumps over 1 s are seeks or delay changes, not lost frames
+    shown = [b[1] - a[1] for a, b in zip(pushes, pushes[1:]) if 0 < b[1] - a[1] < 1]
+    out["tv"] = {"pushes_30s": len(pushes),
+                 "skipped_frames": sum(round(g * fps) - 1 for g in shown if g > 1.5 / fps),
+                 "push_interval_ms": {"median": round(iv[len(iv) // 2] * 1000, 1) if iv else None,
+                                      "p95": round(iv[int(len(iv) * 0.95)] * 1000, 1) if iv else None,
+                                      "max": round(iv[-1] * 1000) if iv else None},
+                 "max_read_and_push_ms": round(max((d[2] for d in pushes), default=0), 1),
+                 "max_loop_pause_ms": round(max((d[1] for d in loops), default=0) * 1000)}
+    sink = disp.get_by_name("tv") if disp else None
+    if sink is not None:
+        try:
+            st = sink.get_property("stats")
+            out["tv"]["tv_rendered_total"], out["tv"]["tv_dropped_total"] = st.get_value("rendered"), st.get_value("dropped")
+        except Exception:  # older GStreamer without sink stats
+            pass
+    return out
+
+
 def cam_of(i):
     i = int(i)
     if not 0 <= i < len(cams):
@@ -1289,10 +1326,13 @@ setup_until, in_setup = start + SETUP_S, True  # live picture first, to point th
 review, paused, behind = False, False, 0.0  # review: rewound/paused, showing `behind` seconds back
 shown_key = None
 kbds, next_scan = {}, 0.0
+diag_pushes = collections.deque(maxlen=8000)  # (time, capture time of the frame shown, ms to read and push)
+diag_loops = collections.deque(maxlen=20000)  # (time, seconds since the previous round)
 
 while True:
     now = time.monotonic()
     dt, last = now - last, now
+    diag_loops.append((now, dt))
     if now >= next_scan:
         scan(kbds)
         next_scan = now + 5
@@ -1392,6 +1432,7 @@ while True:
     key = (tuple(h[1] for h in hits.values()), tv_hit[1] if tv_hit else None, text)
     if key == shown_key:
         continue
+    work = time.perf_counter()
     try:
         jpegs = {i: cams[i].read(h[1]) for i, h in hits.items()}
         tv_frame = (tvr["cam"], tvr["cam"].read(tv_hit[1])) if tv_hit else None
@@ -1403,4 +1444,6 @@ while True:
     else:
         canvas = compose(screen[0], screen[1], layout, {i: (cams[i], j) for i, j in jpegs.items()}, tv_frame, text)
         src.emit("push-buffer", Gst.Buffer.new_wrapped(canvas.tobytes()))
+    if key[0] != (shown_key or ((),))[0]:  # a new camera frame, not just new text
+        diag_pushes.append((now, hits[main][0], (time.perf_counter() - work) * 1000))
     shown_key = key
