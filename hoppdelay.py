@@ -944,7 +944,7 @@ a{color:#58a6ff}#tls{background:#1c2a3a;border-radius:12px;padding:12px 14px;mar
 <h2>Analys på TV:n</h2>
 <div id="ovinfo" class="note"></div>
 <div class="row" id="ovrow"><button data-o="lines">Linjer</button><button data-o="track">Bana &amp; höjd</button><button data-o="pose">Skelett</button></div>
-<div class="row"><button onclick="calOff()">Ta bort sviktmarkering</button></div>
+<div class="row"><button id="calb" onclick="markBoard()">Markera svikten</button><button onclick="calOff()">Ta bort markering</button></div>
 
 <h2>Hopp idag</h2>
 <div id="zinfo" class="note"></div>
@@ -994,12 +994,16 @@ function u(){fetch('/api/state').then(r=>r.json()).then(s=>{S=s;
  $('asb').textContent='Spara automatiskt: '+(s.autosave?'på':'av');$('asb').classList.toggle('on',s.autosave);
  const ov=s.overlay||{};$('ovrow').querySelectorAll('button').forEach(b=>b.classList.toggle('on',!!ov[b.dataset.o]));
  $('ovrow').querySelector('[data-o=pose]').hidden=!s.pose;if(s.cal)SCALE=s.cal.m_per_px;
- $('ovinfo').textContent=!s.cal?'Markera svikten först: ta en repris från kamera 1, välj Svikt, tryck på sviktens spets och sedan rakt under på vattenytan (välj rätt höjd under Mät).'
+ $('calb').textContent=s.cal?'Markera om svikten':'Markera svikten';
+ $('ovinfo').textContent=!s.cal?'Tryck först på Markera svikten.'
   :(ov.track||ov.pose)&&!s.zone?'Bana och skelett räknas för hopp genom zonen – rita en zon under Hopp idag.'
   :'Svikten är markerad ('+s.cal.height+' m). Bana och skelett visas några sekunder efter varje hopp, när det når TV:n.';
  $('tvoff').classList.toggle('on',s.tvrep);$('fbb').hidden=!s.llm;$('poseb').hidden=!s.pose;
  $('zinfo').textContent=s.zone?'Zonen är aktiv: varje hopp genom den hamnar i listan.':'Rita en zon: ta en repris från kamera 1, välj Zon och tryck två hörn i luften framför svikten, där bara hopparen passerar.';})}
-$('ovrow').onclick=e=>{const b=e.target.closest('button');if(b)c('ov_'+b.dataset.o+'/'+(S.overlay&&S.overlay[b.dataset.o]?0:1));};
+$('ovrow').onclick=e=>{const b=e.target.closest('button');if(!b)return;const on=!(S.overlay&&S.overlay[b.dataset.o]);
+ c('ov_'+b.dataset.o+'/'+(on?1:0));
+ if(on&&!S.cal){if(confirm('Svikten är inte markerad än, så TV:n kan inte rita något. Markera den nu?'))markBoard();}
+ else if(on&&b.dataset.o!=='lines'&&!S.zone)alert('Bana och skelett räknas för hopp genom zonen. Rita en zon: ta en repris från kamera 1, välj Zon och tryck två hörn i luften framför svikten.');};
 $('lay').onclick=e=>{const b=e.target.closest('button');if(b)c('layout/'+b.dataset.l);};
 setInterval(u,500);u();
 
@@ -1048,7 +1052,11 @@ function annot(cv,redraw,bar,extra){
     x.fillText(SCALE?num(d*SCALE,2)+' m':Math.round(d)+' px (kalibrera)',(it.p[0][0]+it.p[1][0])/2+lw*4,(it.p[0][1]+it.p[1][1])/2-lw*4);}
    else{const[a,b,cc]=it.p;let g=Math.abs(Math.atan2(a[1]-b[1],a[0]-b[0])-Math.atan2(cc[1]-b[1],cc[0]-b[0]))*180/Math.PI;
     if(g>180)g=360-g;x.fillText(Math.round(g)+'°',b[0]+lw*5,b[1]-lw*5);}}
-  if(A.pts.length)path(A.pts);x.restore();};
+  if(A.pts.length)path(A.pts);
+  if(A.tool==='svikt'){const h=Math.round(x.canvas.height/14);x.font='bold '+h+'px sans-serif';x.fillStyle='#fff';x.shadowBlur=h/3;
+   x.fillText(A.pts.length?'2. Tryck på vattenytan rakt under':'1. Tryck på sviktens spets',h/2,h*1.3);}
+  x.restore();};
+ A.set=k=>{A.tool=k;A.pts=[];bar.querySelectorAll('button').forEach(x=>x.classList.toggle('on',x.dataset.t===k));redraw();};
  return A;}
 
 // ---- Replay on the phone: frames fetched as JPEG blobs, decoded only around the current frame
@@ -1056,7 +1064,11 @@ const A1=annot($('cv'),()=>draw(),$('tb1'),{
  zone:(x0,y0,x1,y1)=>{if(R.cam!==0){alert('Zonen ritas på kamera 1');return;}post('/api/zone',{x0,y0,x1,y1,rot:R.rot}).then(u);},
  // Svikt: first tap on the board tip, second straight below it on the water surface
  svikt:(x0,y0,x1,y1)=>{if(R.cam!==0){alert('Svikten markeras på kamera 1');return;}
-  post('/api/cal',{tip:[x0,y0],water:[x1,y1],height:+$('board').value,rot:R.rot}).then(()=>{u();setTimeout(draw,700);});}});
+  const h=parseFloat((prompt('Hur högt över vattnet är svikten/tornet (meter)?',$('board').value)||'').replace(',','.'));if(!(h>0))return;
+  post('/api/cal',{tip:[x0,y0],water:[x1,y1],height:h,rot:R.rot}).then(()=>{u();setTimeout(draw,700);});}});
+async function markBoard(){
+ if($('rcam').options.length)$('rcam').value='0';
+ await loadReplay(0,S.tv-1,S.tv);A1.set('svikt');$('cv').scrollIntoView({behavior:'smooth',block:'center'});}
 function calOff(){post('/api/cal',{}).then(u);}
 function zoneOff(){fetch('/api/zone',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).then(u);}
 const rawToView=(x,y,rot)=>({none:[x,y],clockwise:[1-y,x],'rotate-180':[1-x,1-y],counterclockwise:[y,1-x]}[rot]);

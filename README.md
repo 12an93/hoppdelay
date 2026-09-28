@@ -123,8 +123,8 @@ tuck – the page says when it is uncertain.
 
 ## Analysis on the TV
 
-Mark the board once: take a replay from camera 1, pick the board height under the measurement marks,
-choose **Board** and tap the board tip, then the water surface straight below it. The camera must not
+Mark the board once: tap **Mark the board**, tap the board tip, then the water surface straight below
+it, and enter the board height. The camera must not
 move afterwards. Under **Analysis on the TV** three switches draw on the delayed picture:
 
 - **Lines** – water, board, +1 m and +2 m above the board, and a line straight up from the tip.
