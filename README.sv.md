@@ -8,6 +8,8 @@ från ett tangentbord/presentationsklickare eller från en iPhone via en egen we
 
 ## Funktioner
 
+- De första 60 s efter start visar TV:n livebild så att kameran kan riktas; sedan startar delayen. Samma
+  liveläge finns ett tryck bort senare (autofokus är fri medan du justerar, låst efteråt).
 - Fördröjd bild på HDMI, skalas automatiskt till skärmen (max 1080p), liggande eller stående.
 - Hela passet spelas in på disken (upp till 40 % av disken, äldsta minuten raderas först).
 - Spola, pausa, ändra delay och rotera – från tangentbord eller telefon.
@@ -35,8 +37,8 @@ från ett tangentbord/presentationsklickare eller från en iPhone via en egen we
 - Mini-PC med Intel-grafik (testad: ASUS VivoMini VM65) och HDMI till TV.
 - USB-kamera med MJPEG upp till 1080p i 30–60 fps (testad: Jabra PanaCast 20, med Intelligent Zoom avstängt i
   Jabra Direct). Största storleken används, sedan högsta bildfrekvens upp till 60 fps
-  (kameror som bara erbjuder 90 eller 120 fps, som vissa med global slutare, körs i det). Autofokus låses 10 s efter
-  start, så den inte jagar när en hoppare passerar.
+  (kameror som bara erbjuder 90 eller 120 fps, som vissa med global slutare, körs i det). Autofokus låses när
+  liveläget tar slut, så den inte jagar när en hoppare passerar.
 - **PanaCast 20 måste anslutas med en USB 2-kabel.** På USB 3 ger den MJPEG bara i 4K.
 - Valfritt: en andra USB-kamera, och tangentbord eller presentationsklickare med USB-dongel.
 
@@ -89,6 +91,7 @@ HTTPS behövs för att iPhone ska kunna spara klipp direkt i Bilder. Certifikate
 | Enter / Esc | Tillbaka till vanlig delay |
 | R | Rotera kamera 1 90° |
 | L | Nästa TV-layout (två kameror) |
+| S | Livebild för att justera kameran / klar |
 
 ## Mätning
 
