@@ -30,6 +30,7 @@ or pool network needed: the box runs its own Wi-Fi.
 - StroMotion picture: the diver pasted in every few frames along the path, in one image.
 - Automatic analysis of a dive: path, highest point, distance out from the board, and number of
   somersaults and turns per second.
+- Height lines, the path with height and distance, and the AI skeleton drawn straight on the delayed TV picture.
 - Optional AI body pose (RTMPose): skeleton on the replay, hip and knee angles, when the diver
   opens, somersaults counted from the trunk (works in tuck too), and body line at entry.
 - Optional AI feedback written from the measurements, using any OpenAI-compatible endpoint (e.g. Ollama).
@@ -119,6 +120,22 @@ it as a replay. With **Save automatically** on, each one is also saved as a clip
 not move) and draws the path on the replay. Mark **Takeoff** and **Water** first and calibrate once
 for metres. Rotation is counted from the body axis, so it works well in straight and pike, less well in
 tuck – the page says when it is uncertain.
+
+## Analysis on the TV
+
+Mark the board once: take a replay from camera 1, pick the board height under the measurement marks,
+choose **Board** and tap the board tip, then the water surface straight below it. The camera must not
+move afterwards. Under **Analysis on the TV** three switches draw on the delayed picture:
+
+- **Lines** – water, board, +1 m and +2 m above the board, and a line straight up from the tip.
+- **Path & height** – for every dive through the zone: the path drawn as the dive plays, the top, and a
+  box with height over the board, distance out at the top and at the water, and somersaults.
+- **Skeleton** (with the AI model) – the body and the hip angle; somersaults are then counted from the
+  trunk, which works in tuck and pike too.
+
+Each dive is analysed in the background on one processor core while the delay counts down, so it is
+ready when the dive reaches the TV (with a short delay of a few seconds it may come a bit late).
+Heights are for the centre of the body and assume the diver moves across the picture, not towards the camera.
 
 ## AI body pose (optional)
 
