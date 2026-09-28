@@ -118,8 +118,8 @@ sidan säger till när den är osäker.
 
 ## Analys på TV:n
 
-Markera svikten en gång: ta en repris från kamera 1, välj sviktens höjd under mätningen, välj
-**Svikt** och tryck på sviktens spets och sedan rakt under den på vattenytan. Kameran får inte flyttas
+Markera svikten en gång: tryck **Markera svikten**, tryck på sviktens spets och sedan rakt under den
+på vattenytan, och skriv in höjden. Kameran får inte flyttas
 efteråt. Under **Analys på TV:n** finns tre knappar som ritar på den fördröjda bilden:
 
 - **Linjer** – vattenytan, svikten, +1 m och +2 m över svikten och en lodlinje från spetsen.
