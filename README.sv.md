@@ -27,6 +27,7 @@ från ett tangentbord/presentationsklickare eller från en iPhone via en egen we
   (och kan sparas automatiskt).
 - StroMotion-bild: hopparen inklistrad var N:e bild längs banan, i en enda bild.
 - Automatisk analys av ett hopp: bana, högsta punkt, avstånd ut från svikten, antal varv och varv per sekund.
+- Höjdlinjer, banan med höjd och avstånd, och AI-skelettet ritade direkt i den fördröjda TV-bilden.
 - Valfri AI-kroppsanalys (RTMPose): skelett på reprisen, höft- och knävinklar, när hopparen öppnar,
   varv räknade på bålen (fungerar även i kort position) och kroppslinjen vid vattnet.
 - Valfri AI-feedback skriven från mätvärdena, via valfri OpenAI-kompatibel tjänst (t.ex. Ollama).
@@ -114,6 +115,22 @@ Med **Spara automatiskt** på sparas varje hopp också som klipp.
 och ritar banan på reprisen. Markera **Upphopp** och **Vatten** först och kalibrera en gång för meter.
 Rotationen räknas från kroppens längdaxel, så den fungerar bra i rak och pik men sämre i kort position –
 sidan säger till när den är osäker.
+
+## Analys på TV:n
+
+Markera svikten en gång: ta en repris från kamera 1, välj sviktens höjd under mätningen, välj
+**Svikt** och tryck på sviktens spets och sedan rakt under den på vattenytan. Kameran får inte flyttas
+efteråt. Under **Analys på TV:n** finns tre knappar som ritar på den fördröjda bilden:
+
+- **Linjer** – vattenytan, svikten, +1 m och +2 m över svikten och en lodlinje från spetsen.
+- **Bana & höjd** – för varje hopp genom zonen: banan ritas medan hoppet spelas, toppen markeras och en
+  ruta visar höjd över svikten, avstånd ut vid toppen och vid vattnet, och antal varv.
+- **Skelett** (med AI-modellen) – kroppen och höftvinkeln; varven räknas då från bålen, vilket fungerar
+  även i grupp och pik.
+
+Varje hopp analyseras i bakgrunden på en processorkärna medan delayen räknar ner, så det är klart när
+hoppet når TV:n (med kort delay på några sekunder kan det komma lite sent). Höjden gäller kroppens mitt
+och förutsätter att hopparen rör sig tvärs över bilden, inte mot kameran.
 
 ## AI-kroppsanalys (valfritt)
 

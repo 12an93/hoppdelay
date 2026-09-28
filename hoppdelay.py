@@ -75,13 +75,14 @@ KEYMAP = {  # key -> command (same commands as the web page)
     E.KEY_ENTER: ("live", 0), E.KEY_ESC: ("live", 0),
     E.KEY_R: ("rotate", 0), E.KEY_L: ("layout_next", 0), E.KEY_S: ("setup_toggle", 0),
 }
-COMMANDS = {"delay_by", "step", "seek", "pause", "live", "rotate", "layout", "layout_next", "autosave", "setup_toggle"}
+COMMANDS = {"delay_by", "step", "seek", "pause", "live", "rotate", "layout", "layout_next", "autosave", "setup_toggle", "ov_lines", "ov_track", "ov_pose"}
 
 Gst.init(None)
 DECODER = "vajpegdec" if Gst.ElementFactory.find("vajpegdec") else "jpegdec"  # Intel GPU decode if available
 ENCODER = "vah264enc" if Gst.ElementFactory.find("vah264enc") else "x264enc speed-preset=veryfast"
 
-state = {"delay": 30, "rots": {}, "layout": "cam0", "zone": None, "autosave": False}
+state = {"delay": 30, "rots": {}, "layout": "cam0", "zone": None, "autosave": False,
+         "cal": None, "overlay": {"lines": False, "track": False, "pose": False}}
 try:
     state.update(json.loads(STATE.read_text()))
 except (OSError, ValueError):
@@ -279,6 +280,11 @@ def decode(jpeg, factor=1, rot="none"):
     return cv2.rotate(img, CV_ROT[rot]) if rot in CV_ROT else img
 
 
+def raw_to_view(x, y, rot):
+    # Normalised point on the camera picture -> normalised point on the rotated picture.
+    return {"none": (x, y), "clockwise": (1 - y, x), "rotate-180": (1 - x, 1 - y), "counterclockwise": (y, 1 - x)}[rot]
+
+
 def view_to_raw(x, y, rot):
     # Normalised point on the rotated picture -> normalised point on the camera picture.
     return {"none": (x, y), "clockwise": (y, 1 - x), "rotate-180": (1 - x, 1 - y), "counterclockwise": (1 - y, x)}[rot]
@@ -377,7 +383,9 @@ def rtmpose(img):
     global pose_sess
     with pose_lock:
         if pose_sess is None:
-            pose_sess = onnxruntime.InferenceSession(str(POSE_MODEL), providers=["CPUExecutionProvider"])
+            opts = onnxruntime.SessionOptions()
+            opts.intra_op_num_threads = 1  # leave the other cores to the TV picture
+            pose_sess = onnxruntime.InferenceSession(str(POSE_MODEL), sess_options=opts, providers=["CPUExecutionProvider"])
     h, w = img.shape[:2]
     bw, bh = w * 1.25, h * 1.25
     if bw > bh * POSE_IN_W / POSE_IN_H:
@@ -465,6 +473,151 @@ def body_pose(cam, t0, t1, rot):
     return out
 
 
+# --- Analysis drawn on the TV ----------------------------------------------------------------
+EDGES = [(5, 7), (7, 9), (6, 8), (8, 10), (5, 6), (5, 11), (6, 12), (11, 12), (11, 13), (13, 15), (12, 14), (14, 16), (0, 5), (0, 6)]
+
+
+def calibration():
+    # Board tip and the water surface below it on camera 1 (normalised camera picture) plus the board
+    # height give the scale and which way is up, even if the camera is tilted or turned.
+    cal = state.get("cal")
+    if not cal or not cams:
+        return None
+    c = cams[0]
+    d = np.hypot((cal["tip"][0] - cal["water"][0]) * c.w, (cal["tip"][1] - cal["water"][1]) * c.h)
+    return {**cal, "m_per_px": cal["height"] / d} if d > 5 else None
+
+
+def view_geometry(cam, rot, cal):
+    # Tip, water point, up and sideways unit vectors in full-size pixels of the rotated picture.
+    vw, vh = (cam.h, cam.w) if rot in ("clockwise", "counterclockwise") else (cam.w, cam.h)
+    tip = np.array(raw_to_view(*cal["tip"], rot)) * (vw, vh)
+    water = np.array(raw_to_view(*cal["water"], rot)) * (vw, vh)
+    up = (tip - water) / np.linalg.norm(tip - water)
+    return tip, water, up, np.array([up[1], -up[0]])
+
+
+def num(v, d=1):
+    return f"{v:.{d}f}".replace(".", ",")
+
+
+def analyse_dive(cam, t0, t1, rot, cal, with_pose):
+    # Path, height over the board, distance out and somersaults of one dive, found automatically.
+    pts = track(cam, t0, t1, rot)
+    if len(pts) < 5:
+        return None
+    tip, water, up, side = view_geometry(cam, rot, cal)
+    m = cal["m_per_px"]
+    height = lambda p: float((np.array([p["x"], p["y"]]) - tip) @ up * m)
+    out = lambda p: abs(float((np.array([p["x"], p["y"]]) - tip) @ side * m))
+    apex = max(pts, key=height)
+    before = [p for p in pts if apex["t"] - 1.2 <= p["t"] <= apex["t"]]
+    takeoff = min(before, key=height)  # lowest point before the top: end of the board press
+    entry = next((p for p in pts if p["t"] > apex["t"] and height(p) <= -cal["height"] + 0.5), pts[-1])
+    air = [p for p in pts if takeoff["t"] <= p["t"] <= entry["t"]]
+    lines = [f"Topp {num(height(apex))} m över svikten, {num(out(apex))} m ut", f"Vatten {num(out(entry))} m ut"]
+    res = {"t0": takeoff["t"] - 0.3, "t1": entry["t"] + 1.5, "rot": rot, "summary": lines, "pose": [],
+           "points": [(p["t"], p["x"], p["y"]) for p in air], "apex": (apex["x"], apex["y"])}
+    if with_pose:
+        frames = [f for f in body_pose(cam, takeoff["t"] - 0.05, entry["t"] + 0.05, rot) if f["score"] > 0.35]
+        res["pose"] = [(f["t"], f["kp"], f["hip"]) for f in frames]
+        hips = [f["hip"] for f in frames if f["hip"] is not None]
+        if hips:
+            lines.append(f"Höft {round(sorted(hips)[min(1, len(hips) - 1)])}° som tätast")
+        trunk = [f["trunk"] for f in frames if f["trunk"] is not None]
+        if len(trunk) >= 5:  # the trunk has a head end, so it counts full turns, also in tuck and pike
+            acc = sum(((b - a + 180) % 360) - 180 for a, b in zip(trunk, trunk[1:]))
+            lines.append(f"ca {num(abs(acc) / 360)} varv")
+            return res
+    ok = [p for p in air if p["elong"] > 1.6]
+    if len(ok) >= 0.7 * len(air) >= 5:  # the body axis only works when the body is long most of the time
+        acc = sum(((b["angle"] - a["angle"] + 90) % 180) - 90 for a, b in zip(ok, ok[1:]))
+        lines.append(f"ca {num(abs(acc) / 360)} varv")
+    return res
+
+
+class Analyzer(threading.Thread):
+    # Analyses every dive from the zone in the background, while the delay is still counting down.
+    def __init__(self, cam):
+        super().__init__(daemon=True)
+        self.cam, self.q, self.results, self.lock = cam, queue.Queue(), collections.deque(maxlen=40), threading.Lock()
+
+    def run(self):
+        while True:
+            t0, t1 = self.q.get()
+            time.sleep(max(0.0, t1 + 0.3 - time.monotonic()))  # until the end of the dive is recorded
+            ov, cal = state.get("overlay") or {}, calibration()
+            if not cal or not (ov.get("track") or ov.get("pose")):
+                continue
+            try:
+                res = analyse_dive(self.cam, t0, t1, rot_of(self.cam.idx), cal, ov.get("pose") and pose_available())
+            except Exception as e:  # never let one odd dive stop the analysis
+                print(f"Analysis failed: {e}", flush=True)
+                continue
+            if res:
+                with self.lock:
+                    self.results.append(res)
+
+    def find(self, t):
+        with self.lock:
+            return next((r for r in reversed(self.results) if r["t0"] <= t <= r["t1"]), None)
+
+
+def draw_overlays(canvas, geo, t):
+    # geo: where camera 1 is on the screen (x, y, screen px per picture px, width, height); t: its frame time.
+    ov, cal = state.get("overlay") or {}, calibration()
+    if not cal:
+        return
+    x0, y0, k, iw, ih = geo
+    rot, cam = rot_of(0), cams[0]
+    tip, water, up, side = view_geometry(cam, rot, cal)
+    ppm = 1 / cal["m_per_px"]
+    rect = (int(x0), int(y0), int(iw), int(ih))
+    S = lambda p: (int(x0 + p[0] * k), int(y0 + p[1] * k))
+    thick = max(1, round(canvas.shape[0] / 500))
+    size = canvas.shape[0] / 1800
+
+    def across(p, color, label):
+        ok, a, b = cv2.clipLine(rect, S(p - side * 10000), S(p + side * 10000))
+        if ok:
+            cv2.line(canvas, a, b, color, thick, cv2.LINE_AA)
+            end = max((a, b), key=lambda q: q[0])
+            put_text(canvas, label, end[0] - int(90 * size * 3), end[1] - 6, size)
+
+    if ov.get("lines"):
+        across(water, (200, 140, 40), "Vatten")
+        across(tip, (255, 255, 255), f"{num(cal['height'], 1).removesuffix(',0')} m")
+        for h in (1, 2):
+            across(tip + up * h * ppm, (170, 170, 170), f"+{h} m")
+        cv2.line(canvas, S(water), S(tip + up * 3 * ppm), (170, 170, 170), thick, cv2.LINE_AA)
+    r = analyzer.find(t) if (ov.get("track") or ov.get("pose")) else None
+    if not r or r["rot"] != rot:
+        return
+    if ov.get("track"):
+        path = [S((x, y)) for pt, x, y in r["points"] if pt <= t]
+        if len(path) > 1:
+            cv2.polylines(canvas, [np.array(path, np.int32)], False, (80, 200, 60), thick + 1, cv2.LINE_AA)
+            cv2.circle(canvas, path[-1], thick * 4, (80, 200, 60), -1, cv2.LINE_AA)
+        if r["points"] and r["points"][0][0] <= t:
+            cv2.circle(canvas, S(r["apex"]), thick * 6, (80, 200, 60), thick, cv2.LINE_AA)
+        lh, bx = canvas.shape[0] / 22, rect[0] + rect[2] - int(canvas.shape[1] * 0.3)
+        by = rect[1] + int(1.2 * lh)
+        box = canvas[by:by + int((len(r["summary"]) + 0.5) * lh), bx - 12:rect[0] + rect[2] - 8]
+        box[:] = box // 3  # darker box so the text stays readable over lines and the picture
+        for n, line in enumerate(r["summary"]):
+            put_text(canvas, line, bx, by + int((n + 1) * lh), size * 1.6)
+    if ov.get("pose") and r["pose"]:
+        f = min(r["pose"], key=lambda f: abs(f[0] - t))
+        if abs(f[0] - t) < 0.6 / cam.fps:
+            kp = f[1]
+            for a, b in EDGES:
+                if kp[a][2] > 0.3 and kp[b][2] > 0.3:
+                    cv2.line(canvas, S(kp[a][:2]), S(kp[b][:2]), (114, 123, 255), thick + 1, cv2.LINE_AA)
+            if f[2] is not None:
+                hp = kp[11] if kp[11][2] > kp[12][2] else kp[12]
+                put_text(canvas, f"{round(f[2])}°", S(hp[:2])[0] + 12, S(hp[:2])[1], size * 1.6)
+
+
 class Detector(threading.Thread):
     # Motion in the zone (camera 1) = a dive. Frames arrive from the capture thread and are dropped if busy.
     def __init__(self, cam):
@@ -513,6 +666,8 @@ class Detector(threading.Thread):
         with self.lock:
             self.events.append({"t0": t0, "t1": t1, "wall": wall})
             del self.events[:-200]
+        if getattr(self, "analyzer", None):
+            self.analyzer.q.put((t0, t1))
         if state.get("autosave"):
             def later():  # wait until the end of the clip has been recorded
                 time.sleep(max(0.0, t1 + 0.3 - time.monotonic()))
@@ -581,12 +736,15 @@ def fit(img, bw, bh):
 
 
 def paste(canvas, img, x, y, bw, bh, border=False):
+    # Returns where the picture landed: (x, y, scale, width, height).
+    scale = min(bw / img.shape[1], bh / img.shape[0])
     img = fit(img, bw, bh)
     h, w = img.shape[:2]
     x, y = x + (bw - w) // 2, y + (bh - h) // 2
     canvas[y:y + h, x:x + w] = img
     if border:
         cv2.rectangle(canvas, (x - 2, y - 2), (x + w + 1, y + h + 1), (255, 255, 255), 2)
+    return x, y, scale, w, h
 
 
 def watermark(img):
@@ -602,8 +760,26 @@ def watermark(img):
 
 
 def put_text(canvas, text, x, y, size):
+    # OpenCV's font is ASCII only: å, ä, ö and ° are drawn as a, a, o, o with the dots/ring added on top.
+    plain = text.translate(str.maketrans("åäöÅÄÖ°–", "aaoAAO -"))
+    font = cv2.FONT_HERSHEY_SIMPLEX
     for color, thick in (((0, 0, 0), 5), ((255, 255, 255), 2)):
-        cv2.putText(canvas, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, size, color, thick, cv2.LINE_AA)
+        cv2.putText(canvas, plain, (x, y), font, size, color, thick, cv2.LINE_AA)
+        for i, ch in enumerate(text):
+            if ch not in "åäöÅÄÖ°":
+                continue
+            x0 = x + cv2.getTextSize(plain[:i], font, size, 2)[0][0]
+            cw, chh = cv2.getTextSize(plain[i], font, size, 2)[0]
+            top = y - (chh if ch in "ÅÄÖ" else int(chh * 0.75)) - max(3, int(size * 7))
+            r = max(1, int(size * 2.2))
+            if ch in "åÅ":
+                cv2.circle(canvas, (x0 + cw // 2, top), r + 1, color, max(1, thick - 1), cv2.LINE_AA)
+            elif ch == "°":
+                ch2 = cv2.getTextSize("0", font, size, 2)[0][1]
+                cv2.circle(canvas, (x0 + cw // 2, y - ch2 + r * 2), r * 2, color, thick, cv2.LINE_AA)
+            else:
+                for dx in (cw // 3, cw * 2 // 3):
+                    cv2.circle(canvas, (x0 + dx, top), r, color, -1 if thick == 2 else thick, cv2.LINE_AA)
 
 
 def decode_for(cam, jpeg, rot, box_w):
@@ -612,25 +788,35 @@ def decode_for(cam, jpeg, rot, box_w):
     factor = 1
     while factor < 8 and width / (factor * 2) >= box_w:
         factor *= 2
-    return decode(jpeg, factor, rot)
+    return decode(jpeg, factor, rot), factor
 
 
-def compose(sw, sh, layout, shown, tv_frame, text):
+def compose(sw, sh, layout, shown, tv_frame, text, cam0_time=None):
     # shown: {camera index: (cam, jpeg)}; tv_frame: (cam, jpeg) of the TV replay or None.
     canvas = np.zeros((sh, sw, 3), np.uint8)
+    geo = None  # where camera 1 ended up, for the analysis overlays
+
+    def put(i, cam, jpeg, *box, border=False):
+        nonlocal geo
+        img, factor = decode_for(cam, jpeg, rot_of(i), box[2])
+        x, y, scale, w, h = paste(canvas, img, *box, border)
+        if i == 0:
+            geo = (x, y, scale / factor, w, h)
+
     if layout == "split" and len(shown) == 2:
         for k, (i, (cam, jpeg)) in enumerate(sorted(shown.items())):
-            paste(canvas, decode_for(cam, jpeg, rot_of(i), sw // 2), k * sw // 2, 0, sw // 2, sh)
+            put(i, cam, jpeg, k * sw // 2, 0, sw // 2, sh)
     else:
         main = 1 if layout == "cam1" and 1 in shown else 0
-        cam, jpeg = shown[main]
-        paste(canvas, decode_for(cam, jpeg, rot_of(main), sw), 0, 0, sw, sh)
+        put(main, *shown[main], 0, 0, sw, sh)
         if layout == "pip" and 1 in shown:
-            cam, jpeg = shown[1]
-            paste(canvas, decode_for(cam, jpeg, rot_of(1), sw // 3), sw * 2 // 3 - 16, sh * 2 // 3 - 16, sw // 3, sh // 3, True)
+            put(1, *shown[1], sw * 2 // 3 - 16, sh * 2 // 3 - 16, sw // 3, sh // 3, border=True)
+    if geo and cam0_time is not None:
+        draw_overlays(canvas, geo, cam0_time)
     if tv_frame:
         cam, jpeg = tv_frame
-        paste(canvas, decode_for(cam, jpeg, rot_of(cam.idx), sw // 3), 16, sh * 2 // 3 - 16, sw // 3, sh // 3, True)
+        img, _ = decode_for(cam, jpeg, rot_of(cam.idx), sw // 3)
+        paste(canvas, img, 16, sh * 2 // 3 - 16, sw // 3, sh // 3, True)
         put_text(canvas, "Repris", 24, sh * 2 // 3, sh / 1000)
     put_text(canvas, text, 16, int(sh / 22), sh / 1200)
     watermark(canvas)
@@ -755,6 +941,11 @@ a{color:#58a6ff}#tls{background:#1c2a3a;border-radius:12px;padding:12px 14px;mar
 <button class="big" onclick="save()">Spara klipp</button>
 </div>
 
+<h2>Analys på TV:n</h2>
+<div id="ovinfo" class="note"></div>
+<div class="row" id="ovrow"><button data-o="lines">Linjer</button><button data-o="track">Bana &amp; höjd</button><button data-o="pose">Skelett</button></div>
+<div class="row"><button onclick="calOff()">Ta bort sviktmarkering</button></div>
+
 <h2>Hopp idag</h2>
 <div id="zinfo" class="note"></div>
 <div class="row"><button id="asb" onclick="c('autosave/'+(S.autosave?0:1))">Spara automatiskt: av</button><button onclick="zoneOff()">Ta bort zon</button></div>
@@ -801,8 +992,14 @@ function u(){fetch('/api/state').then(r=>r.json()).then(s=>{S=s;
  if($('rots').innerHTML!==rh)$('rots').innerHTML=rh;
  if($('rcam').options.length!==s.cams.length)$('rcam').innerHTML=s.cams.map(k=>'<option value="'+k.idx+'">Kamera '+(k.idx+1)+'</option>').join('');
  $('asb').textContent='Spara automatiskt: '+(s.autosave?'på':'av');$('asb').classList.toggle('on',s.autosave);
+ const ov=s.overlay||{};$('ovrow').querySelectorAll('button').forEach(b=>b.classList.toggle('on',!!ov[b.dataset.o]));
+ $('ovrow').querySelector('[data-o=pose]').hidden=!s.pose;if(s.cal)SCALE=s.cal.m_per_px;
+ $('ovinfo').textContent=!s.cal?'Markera svikten först: ta en repris från kamera 1, välj Svikt, tryck på sviktens spets och sedan rakt under på vattenytan (välj rätt höjd under Mät).'
+  :(ov.track||ov.pose)&&!s.zone?'Bana och skelett räknas för hopp genom zonen – rita en zon under Hopp idag.'
+  :'Svikten är markerad ('+s.cal.height+' m). Bana och skelett visas några sekunder efter varje hopp, när det når TV:n.';
  $('tvoff').classList.toggle('on',s.tvrep);$('fbb').hidden=!s.llm;$('poseb').hidden=!s.pose;
  $('zinfo').textContent=s.zone?'Zonen är aktiv: varje hopp genom den hamnar i listan.':'Rita en zon: ta en repris från kamera 1, välj Zon och tryck två hörn i luften framför svikten, där bara hopparen passerar.';})}
+$('ovrow').onclick=e=>{const b=e.target.closest('button');if(b)c('ov_'+b.dataset.o+'/'+(S.overlay&&S.overlay[b.dataset.o]?0:1));};
 $('lay').onclick=e=>{const b=e.target.closest('button');if(b)c('layout/'+b.dataset.l);};
 setInterval(u,500);u();
 
@@ -827,7 +1024,7 @@ let SCALE=parseFloat(store('hd_scale'))||null; // metres per pixel, shared: the 
 const dist=(a,b)=>Math.hypot(a[0]-b[0],a[1]-b[1]);
 function annot(cv,redraw,bar,extra){
  const A={tool:null,pts:[],items:[]};
- bar.innerHTML=[['line','Linje'],['angle','Vinkel'],['cal','Kalibrera'],...(extra?[['zone','Zon']]:[]),['clear','Rensa']]
+ bar.innerHTML=[['line','Linje'],['angle','Vinkel'],['cal','Kalibrera'],...(extra?[['zone','Zon'],['svikt','Svikt']]:[]),['clear','Rensa']]
   .map(([k,l])=>'<button data-t="'+k+'">'+l+'</button>').join('');
  bar.onclick=e=>{const b=e.target.closest('button');if(!b)return;const k=b.dataset.t;
   if(k==='clear'){A.items=[];A.pts=[];A.tool=null;}else{A.tool=A.tool===k?null:k;A.pts=[];}
@@ -835,7 +1032,7 @@ function annot(cv,redraw,bar,extra){
  cv.addEventListener('click',e=>{if(!A.tool)return;const r=cv.getBoundingClientRect();
   A.pts.push([(e.clientX-r.left)*cv.width/r.width,(e.clientY-r.top)*cv.height/r.height]);
   if(A.pts.length===(A.tool==='angle'?3:2)){
-   if(A.tool==='zone'){extra(A.pts[0][0]/cv.width,A.pts[0][1]/cv.height,A.pts[1][0]/cv.width,A.pts[1][1]/cv.height);
+   if(A.tool==='zone'||A.tool==='svikt'){extra[A.tool](A.pts[0][0]/cv.width,A.pts[0][1]/cv.height,A.pts[1][0]/cv.width,A.pts[1][1]/cv.height);
     A.tool=null;bar.querySelectorAll('button').forEach(x=>x.classList.remove('on'));}
    else if(A.tool==='cal'){const m=parseFloat((prompt('Hur lång är linjen i meter? (t.ex. svikthöjden)','3')||'').replace(',','.'));
     if(m>0){SCALE=m/dist(A.pts[0],A.pts[1]);store('hd_scale',SCALE);}}
@@ -855,9 +1052,12 @@ function annot(cv,redraw,bar,extra){
  return A;}
 
 // ---- Replay on the phone: frames fetched as JPEG blobs, decoded only around the current frame
-const A1=annot($('cv'),()=>draw(),$('tb1'),(x0,y0,x1,y1)=>{
- if(R.cam!==0){alert('Zonen ritas på kamera 1');return;}
- fetch('/api/zone',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({x0,y0,x1,y1,rot:R.rot})}).then(u);});
+const A1=annot($('cv'),()=>draw(),$('tb1'),{
+ zone:(x0,y0,x1,y1)=>{if(R.cam!==0){alert('Zonen ritas på kamera 1');return;}post('/api/zone',{x0,y0,x1,y1,rot:R.rot}).then(u);},
+ // Svikt: first tap on the board tip, second straight below it on the water surface
+ svikt:(x0,y0,x1,y1)=>{if(R.cam!==0){alert('Svikten markeras på kamera 1');return;}
+  post('/api/cal',{tip:[x0,y0],water:[x1,y1],height:+$('board').value,rot:R.rot}).then(()=>{u();setTimeout(draw,700);});}});
+function calOff(){post('/api/cal',{}).then(u);}
 function zoneOff(){fetch('/api/zone',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).then(u);}
 const rawToView=(x,y,rot)=>({none:[x,y],clockwise:[1-y,x],'rotate-180':[1-x,1-y],counterclockwise:[y,1-x]}[rot]);
 $('board').value=store('hd_board')||'3';
@@ -888,6 +1088,9 @@ async function draw(){const k=R,n=k&&k.i;if(!k||!k.blobs[n])return;
  if(k.cam===0&&S.zone){const a=rawToView(S.zone[0],S.zone[1],k.rot),b=rawToView(S.zone[2],S.zone[3],k.rot);
   x.save();x.strokeStyle='#3fb950';x.lineWidth=Math.max(2,w/400);x.setLineDash([12,8]);
   x.strokeRect(Math.min(a[0],b[0])*w,Math.min(a[1],b[1])*hh,Math.abs(a[0]-b[0])*w,Math.abs(a[1]-b[1])*hh);x.restore();}
+ if(k.cam===0&&S.cal){const a=rawToView(...S.cal.tip,k.rot),b=rawToView(...S.cal.water,k.rot),lw=Math.max(2,w/400);
+  x.save();x.strokeStyle=x.fillStyle='#58a6ff';x.lineWidth=lw;x.beginPath();x.moveTo(a[0]*w,a[1]*hh);x.lineTo(b[0]*w,b[1]*hh);x.stroke();
+  for(const p of[a,b]){x.beginPath();x.arc(p[0]*w,p[1]*hh,lw*3,0,7);x.fill();}x.restore();}
  if(k.track&&k.track.length){const tr=k.track,lw=Math.max(2,w/350),now=k.times[n];x.save();x.strokeStyle='#3fb950';x.fillStyle='#3fb950';x.lineWidth=lw;
   x.beginPath();tr.forEach((p,j)=>j?x.lineTo(p.x,p.y):x.moveTo(p.x,p.y));x.stroke();
   const ap=tr.reduce((a,b)=>b.y<a.y?b:a);x.beginPath();x.arc(ap.x,ap.y,lw*4,0,7);x.stroke();
@@ -1156,6 +1359,17 @@ class Web(http.server.BaseHTTPRequestHandler):
                 meta = {**clean_meta(body.get("meta") or {}), "cam": cam.idx, "fps": cam.fps}
                 name = new_clip(cam, t0, t1, rot, base, meta)
                 return self.reply(202, json.dumps({"name": name}).encode(), "application/json")
+            if parts == ["api", "cal"]:
+                body = self.body()
+                if body:  # board tip and water surface on the rotated picture of camera 1 -> camera picture
+                    rot = body["rot"] if body.get("rot") in ROTATIONS else "none"
+                    state["cal"] = {"tip": list(view_to_raw(float(body["tip"][0]), float(body["tip"][1]), rot)),
+                                    "water": list(view_to_raw(float(body["water"][0]), float(body["water"][1]), rot)),
+                                    "height": float(body["height"])}
+                else:
+                    state["cal"] = None
+                save_state()
+                return self.reply(204, b"", "text/plain")
             if parts == ["api", "zone"]:
                 body = self.body()
                 if body:  # corners on the rotated picture -> camera picture
@@ -1303,7 +1517,10 @@ if not found:
     raise SystemExit("No camera with MJPEG up to 1080p at 30 fps or more found")
 cams = [Camera(i, dev, w, h, fps, MAX_DISK // len(found)) for i, (dev, w, h, fps) in enumerate(found)]
 detector = Detector(cams[0])
+analyzer = Analyzer(cams[0])
+detector.analyzer = analyzer
 detector.start()
+analyzer.start()
 for c in cams:
     c.start()
 cmds = queue.Queue()  # (command, value) from keyboard and web, applied in the main loop
@@ -1377,6 +1594,8 @@ while True:
         elif cmd == "setup_toggle":
             setup_until = now if now < setup_until else now + SETUP_S
             review = paused = False
+        elif cmd in ("ov_lines", "ov_track", "ov_pose"):
+            state["overlay"] = {**state.get("overlay", {}), cmd[3:]: bool(v)}
         elif cmd == "autosave":
             state["autosave"] = bool(v)
         elif cmd in ("step", "seek", "pause"):  # enter review mode
@@ -1400,7 +1619,8 @@ while True:
     visible = {"cam0": [0], "cam1": [1], "split": [0, 1], "pip": [0, 1]}[layout]
     main = visible[0]
     tvr = tv_replay
-    mode = "jpeg" if len(visible) == 1 and not tvr else "raw"
+    overlays = 0 in visible and calibration() is not None and any((state.get("overlay") or {}).values())
+    mode = "jpeg" if len(visible) == 1 and not tvr and not overlays else "raw"
     want = (mode, main, rot_of(main), screen) if mode == "jpeg" else (mode, screen)
     if want != disp_key:
         if disp:
@@ -1419,7 +1639,8 @@ while True:
     status = {"delay": state["delay"], "review": review, "paused": paused, "behind": back, "span": span, "tv": tv,
               "layout": layout, "zone": state["zone"], "autosave": state["autosave"], "llm": bool(LLM_URL),
               "tvrep": bool(tvr), "pose": pose_available(),
-              "setup": round(max(0.0, setup_until - now)) if not review else 0, "cams": [{"idx": c.idx, "w": c.w, "h": c.h, "rot": rot_of(c.idx), "fps": round(c.measured_fps(now), 1), "nominal": c.fps} for c in cams]}
+              "setup": round(max(0.0, setup_until - now)) if not review else 0,
+              "cal": calibration(), "overlay": state.get("overlay"), "cams": [{"idx": c.idx, "w": c.w, "h": c.h, "rot": rot_of(c.idx), "fps": round(c.measured_fps(now), 1), "nominal": c.fps} for c in cams]}
 
     if in_setup and not review:
         text = f"Live – justera kameran   delay startar om {int(setup_until - now) + 1} s   (S = klar)"
@@ -1429,7 +1650,8 @@ while True:
         text = f"{'Paus  ' if paused else ''}-{mmss(back)}   (Enter = tillbaka till {state['delay']} s)"
     else:
         text = f"Delay {state['delay']} s   inspelat {mmss(span)}"
-    key = (tuple(h[1] for h in hits.values()), tv_hit[1] if tv_hit else None, text)
+    key = (tuple(h[1] for h in hits.values()), tv_hit[1] if tv_hit else None, text,
+           (str(state.get("overlay")), str(state.get("cal")), len(analyzer.results)) if overlays else None)
     if key == shown_key:
         continue
     work = time.perf_counter()
@@ -1442,7 +1664,8 @@ while True:
         txt.set_property("text", text)
         src.emit("push-buffer", Gst.Buffer.new_wrapped(jpegs[main]))
     else:
-        canvas = compose(screen[0], screen[1], layout, {i: (cams[i], j) for i, j in jpegs.items()}, tv_frame, text)
+        canvas = compose(screen[0], screen[1], layout, {i: (cams[i], j) for i, j in jpegs.items()}, tv_frame, text,
+                         hits[0][0] if 0 in hits else None)
         src.emit("push-buffer", Gst.Buffer.new_wrapped(canvas.tobytes()))
     if key[0] != (shown_key or ((),))[0]:  # a new camera frame, not just new text
         diag_pushes.append((now, hits[main][0], (time.perf_counter() - work) * 1000))
