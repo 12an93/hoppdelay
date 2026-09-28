@@ -127,7 +127,8 @@ Mark the board once: tap **Mark the board**, tap the board tip, then the water s
 it, and enter the board height. The camera must not
 move afterwards. Under **Analysis on the TV** three switches draw on the delayed picture:
 
-- **Lines** – water, board, +1 m and +2 m above the board, and a line straight up from the tip.
+- **Lines** – water, board, +1 m and +2 m above the board, and a line straight up from the tip; each
+  can be switched off on its own.
 - **Path & height** – for every dive through the zone: the path drawn as the dive plays, the top, and a
   box with height over the board, distance out at the top and at the water, and somersaults.
 - **Skeleton** (with the AI model) – the body and the hip angle; somersaults are then counted from the

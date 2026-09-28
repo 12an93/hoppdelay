@@ -82,7 +82,8 @@ DECODER = "vajpegdec" if Gst.ElementFactory.find("vajpegdec") else "jpegdec"  # 
 ENCODER = "vah264enc" if Gst.ElementFactory.find("vah264enc") else "x264enc speed-preset=veryfast"
 
 state = {"delay": 30, "rots": {}, "layout": "cam0", "zone": None, "autosave": False,
-         "cal": None, "overlay": {"lines": False, "track": False, "pose": False}}
+         "cal": None, "overlay": {"lines": False, "track": False, "pose": False},
+         "guides": {"water": True, "board": True, "meters": True, "plumb": True}}
 try:
     state.update(json.loads(STATE.read_text()))
 except (OSError, ValueError):
@@ -585,11 +586,16 @@ def draw_overlays(canvas, geo, t):
             put_text(canvas, label, end[0] - int(90 * size * 3), end[1] - 6, size)
 
     if ov.get("lines"):
-        across(water, (200, 140, 40), "Vatten")
-        across(tip, (255, 255, 255), f"{num(cal['height'], 1).removesuffix(',0')} m")
-        for h in (1, 2):
-            across(tip + up * h * ppm, (170, 170, 170), f"+{h} m")
-        cv2.line(canvas, S(water), S(tip + up * 3 * ppm), (170, 170, 170), thick, cv2.LINE_AA)
+        g = state.get("guides") or {}
+        if g.get("water", True):
+            across(water, (200, 140, 40), "Vatten")
+        if g.get("board", True):
+            across(tip, (255, 255, 255), f"{num(cal['height'], 1).removesuffix(',0')} m")
+        if g.get("meters", True):
+            for h in (1, 2):
+                across(tip + up * h * ppm, (170, 170, 170), f"+{h} m")
+        if g.get("plumb", True):
+            cv2.line(canvas, S(water), S(tip + up * 3 * ppm), (170, 170, 170), thick, cv2.LINE_AA)
     r = analyzer.find(t) if (ov.get("track") or ov.get("pose")) else None
     if not r or r["rot"] != rot:
         return
@@ -944,6 +950,7 @@ a{color:#58a6ff}#tls{background:#1c2a3a;border-radius:12px;padding:12px 14px;mar
 <h2>Analys på TV:n</h2>
 <div id="ovinfo" class="note"></div>
 <div class="row" id="ovrow"><button data-o="lines">Linjer</button><button data-o="track">Bana &amp; höjd</button><button data-o="pose">Skelett</button></div>
+<div class="row tools" id="gdrow"><button data-g="water">Vatten</button><button data-g="board">Svikt</button><button data-g="meters">+1/+2 m</button><button data-g="plumb">Lodlinje</button></div>
 <div class="row"><button id="calb" onclick="markBoard()">Markera svikten</button><button onclick="calOff()">Ta bort markering</button></div>
 
 <h2>Hopp idag</h2>
@@ -994,12 +1001,14 @@ function u(){fetch('/api/state').then(r=>r.json()).then(s=>{S=s;
  $('asb').textContent='Spara automatiskt: '+(s.autosave?'på':'av');$('asb').classList.toggle('on',s.autosave);
  const ov=s.overlay||{};$('ovrow').querySelectorAll('button').forEach(b=>b.classList.toggle('on',!!ov[b.dataset.o]));
  $('ovrow').querySelector('[data-o=pose]').hidden=!s.pose;if(s.cal)SCALE=s.cal.m_per_px;
+ $('gdrow').hidden=!ov.lines;$('gdrow').querySelectorAll('button').forEach(b=>b.classList.toggle('on',!!(s.guides||{})[b.dataset.g]));
  $('calb').textContent=s.cal?'Markera om svikten':'Markera svikten';
  $('ovinfo').textContent=!s.cal?'Tryck först på Markera svikten.'
   :(ov.track||ov.pose)&&!s.zone?'Bana och skelett räknas för hopp genom zonen – rita en zon under Hopp idag.'
   :'Svikten är markerad ('+s.cal.height+' m). Bana och skelett visas några sekunder efter varje hopp, när det når TV:n.';
  $('tvoff').classList.toggle('on',s.tvrep);$('fbb').hidden=!s.llm;$('poseb').hidden=!s.pose;
  $('zinfo').textContent=s.zone?'Zonen är aktiv: varje hopp genom den hamnar i listan.':'Rita en zon: ta en repris från kamera 1, välj Zon och tryck två hörn i luften framför svikten, där bara hopparen passerar.';})}
+$('gdrow').onclick=e=>{const b=e.target.closest('button');if(b)post('/api/guides',{[b.dataset.g]:!S.guides[b.dataset.g]}).then(u);};
 $('ovrow').onclick=e=>{const b=e.target.closest('button');if(!b)return;const on=!(S.overlay&&S.overlay[b.dataset.o]);
  c('ov_'+b.dataset.o+'/'+(on?1:0));
  if(on&&!S.cal){if(confirm('Svikten är inte markerad än, så TV:n kan inte rita något. Markera den nu?'))markBoard();}
@@ -1024,16 +1033,27 @@ function physText(m,H,fps){const r=phys(m,H);
  return s+'<br><small>±1 bild ≈ ±'+num(1/(fps||30),3)+' s. Räknat på att tyngdpunkten faller lika mycket som svikthöjden.</small>';}
 
 // ---- Drawing tools (line, angle, calibration) -------------------------------------------
+let SHOWMARK=store('hd_marks')!=='0'; // svikt and zone markers on the replay
 let SCALE=parseFloat(store('hd_scale'))||null; // metres per pixel, shared: the camera does not move
 const dist=(a,b)=>Math.hypot(a[0]-b[0],a[1]-b[1]);
 function annot(cv,redraw,bar,extra){
  const A={tool:null,pts:[],items:[]};
- bar.innerHTML=[['line','Linje'],['angle','Vinkel'],['cal','Kalibrera'],...(extra?[['zone','Zon'],['svikt','Svikt']]:[]),['clear','Rensa']]
+ bar.innerHTML=[['line','Linje'],['angle','Vinkel'],['cal','Kalibrera'],...(extra?[['zone','Zon'],['svikt','Svikt'],['marks','Dölj markering']]:[]),['undo','Ångra'],['clear','Rensa']]
   .map(([k,l])=>'<button data-t="'+k+'">'+l+'</button>').join('');
  bar.onclick=e=>{const b=e.target.closest('button');if(!b)return;const k=b.dataset.t;
-  if(k==='clear'){A.items=[];A.pts=[];A.tool=null;}else{A.tool=A.tool===k?null:k;A.pts=[];}
+  if(k==='clear'){A.items=[];A.pts=[];A.tool=null;}
+  else if(k==='undo'){if(A.pts.length)A.pts.pop();else A.items.pop();}
+  else if(k==='marks'){SHOWMARK=!SHOWMARK;store('hd_marks',SHOWMARK?'1':'0');b.textContent=SHOWMARK?'Dölj markering':'Visa markering';}
+  else{A.tool=A.tool===k?null:k;A.pts=[];}
   bar.querySelectorAll('button').forEach(x=>x.classList.toggle('on',x.dataset.t===A.tool));redraw();};
- cv.addEventListener('click',e=>{if(!A.tool)return;const r=cv.getBoundingClientRect();
+ {const m=bar.querySelector('[data-t=marks]');if(m)m.textContent=SHOWMARK?'Dölj markering':'Visa markering';}
+ cv.addEventListener('click',e=>{const r=cv.getBoundingClientRect();
+  if(!A.tool){ // no tool: tap on a drawn line or angle to remove it
+   const q=[(e.clientX-r.left)*cv.width/r.width,(e.clientY-r.top)*cv.height/r.height],near=cv.width/25;
+   const seg=(a,b)=>{const dx=b[0]-a[0],dy=b[1]-a[1],t=Math.max(0,Math.min(1,((q[0]-a[0])*dx+(q[1]-a[1])*dy)/(dx*dx+dy*dy||1)));return dist(q,[a[0]+t*dx,a[1]+t*dy]);};
+   const i=A.items.findIndex(it=>it.p.some((p,j)=>j&&seg(it.p[j-1],p)<near));
+   if(i>=0&&confirm('Ta bort '+(A.items[i].t==='angle'?'vinkeln':'linjen')+'?')){A.items.splice(i,1);redraw();}
+   return;}
   A.pts.push([(e.clientX-r.left)*cv.width/r.width,(e.clientY-r.top)*cv.height/r.height]);
   if(A.pts.length===(A.tool==='angle'?3:2)){
    if(A.tool==='zone'||A.tool==='svikt'){extra[A.tool](A.pts[0][0]/cv.width,A.pts[0][1]/cv.height,A.pts[1][0]/cv.width,A.pts[1][1]/cv.height);
@@ -1097,10 +1117,10 @@ async function draw(){const k=R,n=k&&k.i;if(!k||!k.blobs[n])return;
  if(cv.width!==w||cv.height!==hh){cv.width=w;cv.height=hh;}
  const x=cv.getContext('2d');x.save();x.translate(w/2,hh/2);x.rotate(ROT[k.rot]);
  x.drawImage(bm,-bm.width/2,-bm.height/2);x.restore();
- if(k.cam===0&&S.zone){const a=rawToView(S.zone[0],S.zone[1],k.rot),b=rawToView(S.zone[2],S.zone[3],k.rot);
+ if(k.cam===0&&S.zone&&SHOWMARK){const a=rawToView(S.zone[0],S.zone[1],k.rot),b=rawToView(S.zone[2],S.zone[3],k.rot);
   x.save();x.strokeStyle='#3fb950';x.lineWidth=Math.max(2,w/400);x.setLineDash([12,8]);
   x.strokeRect(Math.min(a[0],b[0])*w,Math.min(a[1],b[1])*hh,Math.abs(a[0]-b[0])*w,Math.abs(a[1]-b[1])*hh);x.restore();}
- if(k.cam===0&&S.cal){const a=rawToView(...S.cal.tip,k.rot),b=rawToView(...S.cal.water,k.rot),lw=Math.max(2,w/400);
+ if(k.cam===0&&S.cal&&SHOWMARK){const a=rawToView(...S.cal.tip,k.rot),b=rawToView(...S.cal.water,k.rot),lw=Math.max(2,w/400);
   x.save();x.strokeStyle=x.fillStyle='#58a6ff';x.lineWidth=lw;x.beginPath();x.moveTo(a[0]*w,a[1]*hh);x.lineTo(b[0]*w,b[1]*hh);x.stroke();
   for(const p of[a,b]){x.beginPath();x.arc(p[0]*w,p[1]*hh,lw*3,0,7);x.fill();}x.restore();}
  if(k.track&&k.track.length){const tr=k.track,lw=Math.max(2,w/350),now=k.times[n];x.save();x.strokeStyle='#3fb950';x.fillStyle='#3fb950';x.lineWidth=lw;
@@ -1371,6 +1391,11 @@ class Web(http.server.BaseHTTPRequestHandler):
                 meta = {**clean_meta(body.get("meta") or {}), "cam": cam.idx, "fps": cam.fps}
                 name = new_clip(cam, t0, t1, rot, base, meta)
                 return self.reply(202, json.dumps({"name": name}).encode(), "application/json")
+            if parts == ["api", "guides"]:
+                body = self.body()
+                state["guides"] = {k: bool(body.get(k, v)) for k, v in state["guides"].items()}
+                save_state()
+                return self.reply(204, b"", "text/plain")
             if parts == ["api", "cal"]:
                 body = self.body()
                 if body:  # board tip and water surface on the rotated picture of camera 1 -> camera picture
@@ -1652,7 +1677,7 @@ while True:
               "layout": layout, "zone": state["zone"], "autosave": state["autosave"], "llm": bool(LLM_URL),
               "tvrep": bool(tvr), "pose": pose_available(),
               "setup": round(max(0.0, setup_until - now)) if not review else 0,
-              "cal": calibration(), "overlay": state.get("overlay"), "cams": [{"idx": c.idx, "w": c.w, "h": c.h, "rot": rot_of(c.idx), "fps": round(c.measured_fps(now), 1), "nominal": c.fps} for c in cams]}
+              "cal": calibration(), "overlay": state.get("overlay"), "guides": state["guides"], "cams": [{"idx": c.idx, "w": c.w, "h": c.h, "rot": rot_of(c.idx), "fps": round(c.measured_fps(now), 1), "nominal": c.fps} for c in cams]}
 
     if in_setup and not review:
         text = f"Live – justera kameran   delay startar om {int(setup_until - now) + 1} s   (S = klar)"
@@ -1663,7 +1688,7 @@ while True:
     else:
         text = f"Delay {state['delay']} s   inspelat {mmss(span)}"
     key = (tuple(h[1] for h in hits.values()), tv_hit[1] if tv_hit else None, text,
-           (str(state.get("overlay")), str(state.get("cal")), len(analyzer.results)) if overlays else None)
+           (str(state.get("overlay")), str(state.get("cal")), str(state["guides"]), len(analyzer.results)) if overlays else None)
     if key == shown_key:
         continue
     work = time.perf_counter()
