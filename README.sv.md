@@ -122,7 +122,8 @@ Markera svikten en gång: tryck **Markera svikten**, tryck på sviktens spets oc
 på vattenytan, och skriv in höjden. Kameran får inte flyttas
 efteråt. Under **Analys på TV:n** finns tre knappar som ritar på den fördröjda bilden:
 
-- **Linjer** – vattenytan, svikten, +1 m och +2 m över svikten och en lodlinje från spetsen.
+- **Linjer** – vattenytan, svikten, +1 m och +2 m över svikten och en lodlinje från spetsen; var och
+  en kan stängas av.
 - **Bana & höjd** – för varje hopp genom zonen: banan ritas medan hoppet spelas, toppen markeras och en
   ruta visar höjd över svikten, avstånd ut vid toppen och vid vattnet, och antal varv.
 - **Skelett** (med AI-modellen) – kroppen och höftvinkeln; varven räknas då från bålen, vilket fungerar
