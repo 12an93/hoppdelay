@@ -35,6 +35,7 @@ or pool network needed: the box runs its own Wi-Fi.
   opens, somersaults counted from the trunk (works in tuck too), and body line at entry.
 - Optional AI feedback written from the measurements, using any OpenAI-compatible endpoint (e.g. Ollama).
 - Own Wi-Fi hotspot, starts by itself when power is connected.
+- Live broadcast of the camera to YouTube and to a local web page, over a network cable.
 
 ## Hardware
 
@@ -53,7 +54,7 @@ In the BIOS, set *Restore AC Power Loss → Power On* so the box starts when pow
 
 ```
 sudo sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=0/' /etc/default/grub && sudo update-grub && echo 'FSCKFIX=yes' | sudo tee -a /etc/default/rcS
-sudo apt install -y avahi-daemon openssl iw dnsmasq-base v4l-utils python3-evdev python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly intel-media-va-driver python3-opencv python3-numpy
+sudo apt install -y avahi-daemon openssl iw dnsmasq-base v4l-utils python3-evdev python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav intel-media-va-driver python3-opencv python3-numpy
 sudo install -m755 hoppdelay.py /usr/local/bin/hoppdelay.py && sudo install -m644 hoppdelay.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now hoppdelay
 ```
 
@@ -137,6 +138,24 @@ move afterwards. Under **Analysis on the TV** three switches draw on the delayed
 Each dive is analysed in the background on one processor core while the delay counts down, so it is
 ready when the dive reaches the TV (with a short delay of a few seconds it may come a bit late).
 Heights are for the centre of the body and assume the diver moves across the picture, not towards the camera.
+
+## Live broadcast
+
+Connect a network cable for internet (the Wi-Fi hotspot keeps working). Under **Broadcast** on the
+phone, **Start broadcast** sends the live picture of camera 1 – not delayed; the TV keeps its delay – as
+720p H.264, encoded on the GPU:
+
+- **On site:** `http://<address>/live`, shown on the phone page for each network the box is on (its own
+  Wi-Fi, or the hall network through the cable). Plays in Safari and on phones, 3–6 s behind; on a
+  computer without Safari, open `http://<address>/hls/live.m3u8` in VLC. No internet needed.
+- **YouTube:** paste the stream key from YouTube Studio once; it is kept on the box only (readable by
+  root), never shown again. About 4 Mbit/s upload is needed – test the hall network first. If the
+  connection drops, the box retries every 10 s and the local page keeps going.
+- **Sound from the camera** is off by default (a silent track is sent, which YouTube wants). Switch it
+  on to send the camera microphone.
+
+The broadcast never starts by itself after a restart. Check the rules of the organiser before
+broadcasting a competition – many divers are minors.
 
 ## AI body pose (optional)
 

@@ -32,6 +32,7 @@ från ett tangentbord/presentationsklickare eller från en iPhone via en egen we
   varv räknade på bålen (fungerar även i kort position) och kroppslinjen vid vattnet.
 - Valfri AI-feedback skriven från mätvärdena, via valfri OpenAI-kompatibel tjänst (t.ex. Ollama).
 - Eget Wi-Fi (hotspot) – kräver inget nät i simhallen.
+- Livesändning av kameran till YouTube och till en lokal webbsida, via nätverkssladd.
 
 ## Hårdvara
 
@@ -49,7 +50,7 @@ BIOS: *Restore AC Power Loss → Power On* så att datorn startar när strömmen
 
 ```
 sudo sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=0/' /etc/default/grub && sudo update-grub && echo 'FSCKFIX=yes' | sudo tee -a /etc/default/rcS
-sudo apt install -y avahi-daemon openssl iw dnsmasq-base v4l-utils python3-evdev python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly intel-media-va-driver python3-opencv python3-numpy
+sudo apt install -y avahi-daemon openssl iw dnsmasq-base v4l-utils python3-evdev python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav intel-media-va-driver python3-opencv python3-numpy
 sudo install -m755 hoppdelay.py /usr/local/bin/hoppdelay.py && sudo install -m644 hoppdelay.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now hoppdelay
 ```
 
@@ -132,6 +133,24 @@ efteråt. Under **Analys på TV:n** finns tre knappar som ritar på den fördrö
 Varje hopp analyseras i bakgrunden på en processorkärna medan delayen räknar ner, så det är klart när
 hoppet når TV:n (med kort delay på några sekunder kan det komma lite sent). Höjden gäller kroppens mitt
 och förutsätter att hopparen rör sig tvärs över bilden, inte mot kameran.
+
+## Livesändning
+
+Koppla in en nätverkssladd för internet (wifi-hotspoten fungerar som vanligt). Under **Sändning** på
+telefonen skickar **Starta sändning** live-bilden från kamera 1 – utan delay; TV:n behåller sin delay –
+som 720p H.264, kodad i grafikkretsen:
+
+- **På plats:** `http://<adress>/live`, som visas på telefonsidan för varje nät boxen är på (eget wifi,
+  eller hallens nät via sladden). Spelas i Safari och på telefoner, 3–6 s efter; på en dator utan
+  Safari, öppna `http://<adress>/hls/live.m3u8` i VLC. Kräver inget internet.
+- **YouTube:** klistra in streamnyckeln från YouTube Studio en gång; den sparas bara på boxen (läsbar
+  för root) och visas aldrig igen. Ungefär 4 Mbit/s uppladdning behövs – testa hallens nät först. Om
+  anslutningen bryts försöker boxen igen var 10:e sekund och den lokala sidan fortsätter.
+- **Ljud från kameran** är av från början (ett tyst ljudspår skickas, det vill YouTube ha). Slå på för
+  att skicka kamerans mikrofon.
+
+Sändningen startar aldrig av sig själv efter en omstart. Kolla arrangörens regler innan du sänder en
+tävling – många hoppare är minderåriga.
 
 ## AI-kroppsanalys (valfritt)
 

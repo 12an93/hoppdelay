@@ -79,15 +79,30 @@ COMMANDS = {"delay_by", "step", "seek", "pause", "live", "rotate", "layout", "la
 
 Gst.init(None)
 DECODER = "vajpegdec" if Gst.ElementFactory.find("vajpegdec") else "jpegdec"  # Intel GPU decode if available
+
+
+def decoder_works(dec, jpeg, w, h):
+    # Some cameras send JPEG the GPU decoder does not take (e.g. 4:2:2); try one real frame first.
+    p = Gst.parse_launch(f"appsrc name=src caps=image/jpeg,width={w},height={h},framerate=30/1 ! jpegparse ! {dec} ! "
+                         "videoconvert ! videoflip method=clockwise ! videoconvert ! video/x-raw,format=BGR ! fakesink")
+    p.set_state(Gst.State.PLAYING)
+    src = p.get_by_name("src")
+    src.emit("push-buffer", Gst.Buffer.new_wrapped(jpeg))
+    src.emit("end-of-stream")
+    msg = p.get_bus().timed_pop_filtered(5 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
+    p.set_state(Gst.State.NULL)
+    return msg is not None and msg.type == Gst.MessageType.EOS
 ENCODER = "vah264enc" if Gst.ElementFactory.find("vah264enc") else "x264enc speed-preset=veryfast"
 
 state = {"delay": 30, "rots": {}, "layout": "cam0", "zone": None, "autosave": False,
          "cal": None, "overlay": {"lines": False, "track": False, "pose": False},
-         "guides": {"water": True, "board": True, "meters": True, "plumb": True}}
+         "guides": {"water": True, "board": True, "meters": True, "plumb": True},
+         "stream": {"key": "", "audio": False}}
 try:
     state.update(json.loads(STATE.read_text()))
 except (OSError, ValueError):
     pass
+state["stream"]["on"] = False  # never start a broadcast by itself after a restart
 if "rot" in state:  # older versions had one rotation
     state["rots"].setdefault("0", state.pop("rot"))
 state_lock = threading.Lock()
@@ -96,6 +111,7 @@ state_lock = threading.Lock()
 def save_state():
     with state_lock:
         STATE.write_text(json.dumps(state))
+        STATE.chmod(0o600)  # holds the YouTube stream key
 
 
 def rot_of(i):
@@ -232,7 +248,7 @@ def save_clip(cam, t0, t1, rot, name):
     tmp = CLIPS / (name + ".part")
     p = Gst.parse_launch(
         f"appsrc name=src format=time block=true caps=image/jpeg,width={cam.w},height={cam.h},framerate={gst_rate(cam.fps)} ! "
-        f"jpegparse ! {DECODER} ! videoflip method={rot} ! videoconvert ! {WATERMARK_GST} ! videoconvert ! video/x-raw,format=NV12 ! "
+        f"jpegparse ! {DECODER} ! videoconvert ! videoflip method={rot} ! videoconvert ! {WATERMARK_GST} ! videoconvert ! video/x-raw,format=NV12 ! "
         f"{ENCODER} ! h264parse ! mp4mux ! filesink name=sink"
     )
     p.get_by_name("sink").set_property("location", str(tmp))  # names may contain spaces
@@ -472,6 +488,164 @@ def body_pose(cam, t0, t1, rot):
         out.append({"t": t, "kp": np.round(kp, 1).tolist(), "score": float(kp[:, 2].mean()),
                     "hip": angle_at(sho, hip, kne), "knee": angle_at(hip, kne, ank), "trunk": trunk, "line": line})
     return out
+
+
+# --- Live broadcast: YouTube and a local page ---------------------------------------------------
+HLS_DIR = pathlib.Path("/dev/shm/hoppdelay-hls")
+YOUTUBE_URL = "rtmps://a.rtmps.youtube.com/live2/"
+AAC = next((e for e in ("fdkaacenc", "avenc_aac", "voaacenc") if Gst.ElementFactory.find(e)), None)
+
+
+def camera_mic():
+    # ALSA card of the camera's microphone (a USB camera that is not a sound card on its own is skipped).
+    try:
+        for line in pathlib.Path("/proc/asound/cards").read_text().splitlines():
+            m = re.match(r"\s*(\d+) \[.*\]: USB-Audio - (.*)", line)
+            if m and any(k in m.group(2).lower() for k in ("panacast", "camera", "webcam", "cam")):
+                return f"plughw:{m.group(1)},0"
+    except OSError:
+        pass
+    return None
+
+
+def local_addresses():
+    try:
+        out = subprocess.run(["ip", "-4", "-o", "addr", "show", "scope", "global"], capture_output=True, text=True).stdout
+    except OSError:
+        return []
+    return [a.split()[3].split("/")[0] for a in out.splitlines() if len(a.split()) > 3]
+
+
+class Broadcast:
+    # Live picture of camera 1 (not delayed), 720p H.264 on the GPU. Two separate pipelines, so a
+    # dropped internet connection only stops YouTube, never the local page. YouTube retries by itself.
+    def __init__(self, cam):
+        self.cam, self.lock, self.pipes, self.status = cam, threading.Lock(), {}, {"local": "av", "youtube": "av"}
+        self.rot, self.retry_at, self.started = None, {}, {}
+        self.mic, self.addrs, self.checked = None, [], 0.0
+        cam.listeners.append(self.feed)
+        threading.Thread(target=self.watch, daemon=True).start()
+
+    def size(self):
+        w, h = (self.cam.h, self.cam.w) if self.rot in ("clockwise", "counterclockwise") else (self.cam.w, self.cam.h)
+        s = 720 / min(w, h)
+        return int(w * s) // 2 * 2, int(h * s) // 2 * 2
+
+    def video(self, kbps):
+        w, h = self.size()
+        key = max(1, round(self.cam.fps))  # a keyframe every second: short HLS segments, quick YouTube start
+        enc = (f"vah264enc bitrate={kbps} key-int-max={key} rate-control=cbr b-frames=0" if ENCODER.startswith("vah264enc")
+               else f"x264enc speed-preset=veryfast tune=zerolatency bitrate={kbps} key-int-max={key}")
+        return (f"appsrc name=src is-live=true do-timestamp=true format=time max-buffers=2 leaky-type=downstream "
+                f"caps=image/jpeg,width={self.cam.w},height={self.cam.h},framerate={gst_rate(self.cam.fps)} ! "
+                f"jpegparse ! {DECODER} ! videoconvert ! videoflip method={self.rot} ! videoscale ! videoconvert ! "
+                f"video/x-raw,width={w},height={h},pixel-aspect-ratio=1/1 ! {WATERMARK_GST} ! videoconvert ! "
+                f"video/x-raw,format=NV12 ! {enc} ! h264parse ! queue ! ")
+
+    def build(self, kind):
+        if kind == "local":
+            shutil.rmtree(HLS_DIR, ignore_errors=True)
+            HLS_DIR.mkdir(parents=True)
+            return Gst.parse_launch(self.video(2500) + f"hlssink2 location={HLS_DIR}/seg%05d.ts "
+                                    f"playlist-location={HLS_DIR}/live.m3u8 target-duration=1 playlist-length=4 max-files=8")
+        mic = camera_mic() if state["stream"]["audio"] else None
+        audio = (f"alsasrc device={mic} ! queue ! audioconvert ! audioresample" if mic
+                 else "audiotestsrc is-live=true wave=silence ! audioconvert ! audioresample")  # YouTube wants a sound track
+        desc = self.video(3500) + 'flvmux name=mux streamable=true ! rtmp2sink name=out async-connect=true '
+        if AAC:
+            desc += f" {audio} ! audio/x-raw,rate=44100,channels=2 ! {AAC} bitrate=128000 ! aacparse ! queue ! mux."
+        p = Gst.parse_launch(desc)
+        p.get_by_name("out").set_property("location", YOUTUBE_URL + state["stream"]["key"])  # the key never in a log line
+        return p
+
+    def wanted(self):
+        st = state["stream"]
+        return {"local"} | ({"youtube"} if st["key"] else set()) if st["on"] else set()
+
+    def apply(self):
+        with self.lock:
+            want = self.wanted()
+            for kind in list(self.pipes):
+                if kind not in want:
+                    self.stop(kind)
+                    self.status[kind] = "av"
+            for kind in want - set(self.pipes):
+                self.start(kind)
+
+    def restart(self):
+        with self.lock:
+            for kind in list(self.pipes):
+                self.stop(kind)
+        self.apply()
+
+    def start(self, kind):
+        self.rot = rot_of(self.cam.idx)
+        try:
+            p = self.build(kind)
+            p.set_state(Gst.State.PLAYING)
+            self.pipes[kind] = p
+            self.status[kind] = "ansluter" if kind == "youtube" else "sänder"
+            self.started[kind] = time.monotonic()
+        except Exception as e:  # e.g. a missing GStreamer element
+            self.status[kind] = f"fel: {e}"
+            self.retry_at[kind] = time.monotonic() + 15
+
+    def stop(self, kind):
+        p = self.pipes.pop(kind)
+        p.get_by_name("src").emit("end-of-stream")
+        p.set_state(Gst.State.NULL)
+
+    def feed(self, t, jpeg):
+        with self.lock:
+            pipes = list(self.pipes.values())
+        for p in pipes:
+            p.get_by_name("src").emit("push-buffer", Gst.Buffer.new_wrapped(jpeg))
+
+    def watch(self):
+        while True:
+            time.sleep(0.5)
+            try:
+                self.check()
+            except Exception as e:  # the broadcast watchdog must never stop
+                print(f"Broadcast watch: {e}", flush=True)
+
+    def check(self):
+        if time.monotonic() - self.checked > 5:  # network cable and microphone can come and go
+            self.mic, self.addrs, self.checked = camera_mic(), local_addresses(), time.monotonic()
+        if self.pipes and rot_of(self.cam.idx) != self.rot:
+            self.restart()  # new rotation: new picture size
+        with self.lock:
+            for kind, p in list(self.pipes.items()):
+                msg = p.get_bus().pop_filtered(Gst.MessageType.ERROR)
+                if msg:
+                    err, _ = msg.parse_error()
+                    text = err.message.replace(state["stream"]["key"] or "\0", "…")  # never show the key
+                    print(f"Broadcast {kind}: {text}", flush=True)
+                    self.stop(kind)
+                    self.status[kind] = f"fel: {text} – försöker igen"
+                    self.retry_at[kind] = time.monotonic() + 10
+                elif kind == "youtube" and self.status[kind] == "ansluter" and time.monotonic() - self.started[kind] > 4:
+                    self.status[kind] = "sänder"
+            for kind in self.wanted() - set(self.pipes):
+                if time.monotonic() >= self.retry_at.get(kind, 0):
+                    self.start(kind)
+
+    def info(self):
+        st = state["stream"]
+        return {"on": st["on"], "audio": st["audio"], "has_key": bool(st["key"]), "mic": self.mic is not None,
+                "local": self.status["local"], "youtube": self.status["youtube"] if st["key"] else "ingen nyckel",
+                "addrs": self.addrs}
+
+
+LIVE_PAGE = b"""<!doctype html><html lang="sv"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Hoppdelay live</title>
+<style>html,body{margin:0;height:100%;background:#000;color:#aaa;font:15px -apple-system,sans-serif}
+video{width:100%;height:100%;object-fit:contain}#m{position:fixed;top:8px;left:10px}</style></head><body>
+<video id="v" src="/hls/live.m3u8" autoplay muted playsinline controls></video><div id="m"></div>
+<script>const v=document.getElementById('v'),m=document.getElementById('m');
+if(!v.canPlayType('application/vnd.apple.mpegurl')){v.removeAttribute('src');v.hidden=true;m.textContent='Den h\u00e4r webbl\u00e4saren kan inte spela livebilden. Anv\u00e4nd Safari, en telefon eller VLC med '+location.origin+'/hls/live.m3u8';}
+else v.onerror=()=>{m.textContent='V\u00e4ntar p\u00e5 s\u00e4ndningen\u2026';setTimeout(()=>{v.src='/hls/live.m3u8?'+Date.now();v.play().catch(()=>{});},3000);};
+v.onplaying=()=>{m.textContent='';};</script></body></html>"""
 
 
 # --- Analysis drawn on the TV ----------------------------------------------------------------
@@ -714,7 +888,7 @@ def display_jpeg(cam, rot, sw, sh, conn):
     # One camera full screen: JPEG decoded by the GPU, scaled with black borders, text on top.
     p = Gst.parse_launch(
         f"appsrc name=src is-live=true max-buffers=1 leaky-type=downstream do-timestamp=true format=time caps=image/jpeg,width={cam.w},height={cam.h},framerate={gst_rate(cam.fps)} ! "
-        f"jpegparse ! {DECODER} ! videoflip method={rot} ! videoconvert ! "
+        f"jpegparse ! {DECODER} ! videoconvert ! videoflip method={rot} ! videoconvert ! "
         f"videoscale add-borders=true ! video/x-raw,width={sw},height={sh},pixel-aspect-ratio=1/1 ! "
         'textoverlay name=txt valignment=top halignment=left font-desc="Sans 20" ! '
         f"{WATERMARK_GST} ! "
@@ -879,8 +1053,8 @@ h1{font-size:28px;margin:4px 0 2px}h2{font-size:20px;margin:28px 0 6px;border-to
 h3{font-size:16px;color:#bbb;margin:16px 0 0}
 #sub,#info,#cinfo{color:#999;margin:6px 0}
 .row{display:flex;gap:8px;margin:10px 0}.row>*{flex:1;min-width:0}
-button,select,input[type=text]{background:#2a2a2a;color:#eee;border:0;border-radius:12px;padding:18px 0;font-size:20px;text-align:center}
-input[type=text]{padding:14px 10px;font-size:17px;text-align:left}
+button,select,input[type=text],input[type=password]{background:#2a2a2a;color:#eee;border:0;border-radius:12px;padding:18px 0;font-size:20px;text-align:center}
+input[type=text],input[type=password]{padding:14px 10px;font-size:17px;text-align:left}
 button:active{background:#444}.big{background:#1f6feb;width:100%}.on{background:#1f6feb}
 .tools button,.marks button{padding:12px 0;font-size:15px}
 input[type=range]{width:100%;height:40px}label{color:#999;font-size:14px}
@@ -953,6 +1127,13 @@ a{color:#58a6ff}#tls{background:#1c2a3a;border-radius:12px;padding:12px 14px;mar
 <div class="row tools" id="gdrow"><button data-g="water">Vatten</button><button data-g="board">Svikt</button><button data-g="meters">+1/+2 m</button><button data-g="plumb">Lodlinje</button></div>
 <div class="row"><button id="calb" onclick="markBoard()">Markera svikten</button><button onclick="calOff()">Ta bort markering</button></div>
 
+<h2>Sändning</h2>
+<div id="stinfo" class="note"></div>
+<button class="big" id="stb" onclick="streamToggle()">Starta sändning</button>
+<div class="row"><button id="stau" onclick="post('/api/stream',{audio:!S.stream.audio}).then(u)">Ljud från kameran: av</button></div>
+<div class="row"><input type="password" id="ytkey" placeholder="YouTube-streamnyckel" autocomplete="off"><button onclick="saveKey()" style="flex:0 0 30%">Spara</button></div>
+<div class="row"><button id="ytdel" onclick="if(confirm('Ta bort YouTube-nyckeln?'))post('/api/stream',{key:''}).then(u)">Ta bort nyckel</button></div>
+
 <h2>Hopp idag</h2>
 <div id="zinfo" class="note"></div>
 <div class="row"><button id="asb" onclick="c('autosave/'+(S.autosave?0:1))">Spara automatiskt: av</button><button onclick="zoneOff()">Ta bort zon</button></div>
@@ -1002,12 +1183,23 @@ function u(){fetch('/api/state').then(r=>r.json()).then(s=>{S=s;
  const ov=s.overlay||{};$('ovrow').querySelectorAll('button').forEach(b=>b.classList.toggle('on',!!ov[b.dataset.o]));
  $('ovrow').querySelector('[data-o=pose]').hidden=!s.pose;if(s.cal)SCALE=s.cal.m_per_px;
  $('gdrow').hidden=!ov.lines;$('gdrow').querySelectorAll('button').forEach(b=>b.classList.toggle('on',!!(s.guides||{})[b.dataset.g]));
+ const st=s.stream;$('stb').textContent=st.on?'Stoppa sändning':'Starta sändning';$('stb').style.background=st.on?'#da3633':'';
+ $('stau').textContent='Ljud från kameran: '+(st.audio?'på':'av')+(st.audio&&!st.mic?' (ingen mikrofon hittad)':'');$('stau').classList.toggle('on',st.audio);
+ $('ytkey').placeholder=st.has_key?'Nyckel sparad – byt här':'YouTube-streamnyckel';$('ytdel').hidden=!st.has_key;
+ const links=st.addrs.map(a=>'<a href="http://'+a+'/live" style="color:#58a6ff">http://'+a+'/live</a>').join(' eller ');
+ const sti=st.on?'<b>Sänder live-bilden från kamera 1.</b><br>På plats: '+links+' ('+st.local+')<br>YouTube: '+st.youtube
+  :'Sänder live-bilden från kamera 1 (utan delay, TV:n behåller sin delay) till en webbsida för alla på samma nät, och till YouTube om en nyckel är sparad.'+(st.has_key?' YouTube-nyckel sparad.':'');
+ if(sti!==window.lastSti){$('stinfo').innerHTML=sti;window.lastSti=sti;}
  $('calb').textContent=s.cal?'Markera om svikten':'Markera svikten';
  $('ovinfo').textContent=!s.cal?'Tryck först på Markera svikten.'
   :(ov.track||ov.pose)&&!s.zone?'Bana och skelett räknas för hopp genom zonen – rita en zon under Hopp idag.'
   :'Svikten är markerad ('+s.cal.height+' m). Bana och skelett visas några sekunder efter varje hopp, när det når TV:n.';
  $('tvoff').classList.toggle('on',s.tvrep);$('fbb').hidden=!s.llm;$('poseb').hidden=!s.pose;
  $('zinfo').textContent=s.zone?'Zonen är aktiv: varje hopp genom den hamnar i listan.':'Rita en zon: ta en repris från kamera 1, välj Zon och tryck två hörn i luften framför svikten, där bara hopparen passerar.';})}
+function streamToggle(){const on=!S.stream.on;
+ if(on&&S.stream.has_key&&!confirm('Starta sändningen? Den går till YouTube direkt, synlig enligt inställningen i YouTube Studio.'))return;
+ post('/api/stream',{on}).then(u);}
+function saveKey(){const k=$('ytkey').value.trim();if(!k)return;post('/api/stream',{key:k}).then(()=>{$('ytkey').value='';u();});}
 $('gdrow').onclick=e=>{const b=e.target.closest('button');if(b)post('/api/guides',{[b.dataset.g]:!S.guides[b.dataset.g]}).then(u);};
 $('ovrow').onclick=e=>{const b=e.target.closest('button');if(!b)return;const on=!(S.overlay&&S.overlay[b.dataset.o]);
  c('ov_'+b.dataset.o+'/'+(on?1:0));
@@ -1350,6 +1542,13 @@ class Web(http.server.BaseHTTPRequestHandler):
             if parts == ["api", "track"]:
                 pts = track(cam_of(q["cam"]), float(q["t0"]), float(q["t1"]), rot_param(q))
                 return self.reply(200, json.dumps(pts).encode(), "application/json")
+            if parts == ["live"]:
+                return self.reply(200, LIVE_PAGE, "text/html; charset=utf-8")
+            if len(parts) == 2 and parts[0] == "hls" and re.fullmatch(r"[\w.]+", parts[1]):
+                f = HLS_DIR / parts[1]
+                if not f.exists():
+                    return self.reply(404, b"", "text/plain")
+                return self.reply(200, f.read_bytes(), "application/vnd.apple.mpegurl" if f.suffix == ".m3u8" else "video/mp2t")
             if parts == ["ca.crt"]:
                 return self.reply(200, (CERTS / "ca.crt").read_bytes(), "application/x-x509-ca-cert")
             if parts == ["api", "clips"]:
@@ -1391,6 +1590,19 @@ class Web(http.server.BaseHTTPRequestHandler):
                 meta = {**clean_meta(body.get("meta") or {}), "cam": cam.idx, "fps": cam.fps}
                 name = new_clip(cam, t0, t1, rot, base, meta)
                 return self.reply(202, json.dumps({"name": name}).encode(), "application/json")
+            if parts == ["api", "stream"]:
+                body, st = self.body(), state["stream"]
+                if "key" in body:
+                    st["key"] = re.sub(r"[^\w-]", "", str(body["key"]))  # YouTube keys are letters, digits and -
+                for k in ("on", "audio"):
+                    if k in body:
+                        st[k] = bool(body[k])
+                save_state()
+                if ("key" in body or "audio" in body) and st["on"]:
+                    broadcast.restart()
+                else:
+                    broadcast.apply()
+                return self.reply(204, b"", "text/plain")
             if parts == ["api", "guides"]:
                 body = self.body()
                 state["guides"] = {k: bool(body.get(k, v)) for k, v in state["guides"].items()}
@@ -1558,8 +1770,19 @@ analyzer = Analyzer(cams[0])
 detector.analyzer = analyzer
 detector.start()
 analyzer.start()
+broadcast = Broadcast(cams[0])
 for c in cams:
     c.start()
+if DECODER != "jpegdec":
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not all(c.times for c in cams):
+        time.sleep(0.05)
+    for c in cams:
+        if c.times and not decoder_works(DECODER, c.read(c.refs[-1]), c.w, c.h):
+            print(f"{DECODER} cannot decode camera {c.idx + 1}, using jpegdec", flush=True)
+            DECODER = "jpegdec"
+            break
+print(f"Decoder: {DECODER}", flush=True)
 cmds = queue.Queue()  # (command, value) from keyboard and web, applied in the main loop
 status = {}  # snapshot for the web page, replaced every loop
 tv_replay = None  # replay looping in a corner of the TV: {"cam", "t0", "t1", "speed", "start"}
@@ -1677,7 +1900,8 @@ while True:
               "layout": layout, "zone": state["zone"], "autosave": state["autosave"], "llm": bool(LLM_URL),
               "tvrep": bool(tvr), "pose": pose_available(),
               "setup": round(max(0.0, setup_until - now)) if not review else 0,
-              "cal": calibration(), "overlay": state.get("overlay"), "guides": state["guides"], "cams": [{"idx": c.idx, "w": c.w, "h": c.h, "rot": rot_of(c.idx), "fps": round(c.measured_fps(now), 1), "nominal": c.fps} for c in cams]}
+              "cal": calibration(), "overlay": state.get("overlay"), "guides": state["guides"],
+              "stream": broadcast.info(), "cams": [{"idx": c.idx, "w": c.w, "h": c.h, "rot": rot_of(c.idx), "fps": round(c.measured_fps(now), 1), "nominal": c.fps} for c in cams]}
 
     if in_setup and not review:
         text = f"Live – justera kameran   delay startar om {int(setup_until - now) + 1} s   (S = klar)"
