@@ -79,6 +79,19 @@ COMMANDS = {"delay_by", "step", "seek", "pause", "live", "rotate", "layout", "la
 
 Gst.init(None)
 DECODER = "vajpegdec" if Gst.ElementFactory.find("vajpegdec") else "jpegdec"  # Intel GPU decode if available
+
+
+def decoder_works(dec, jpeg, w, h):
+    # Some cameras send JPEG the GPU decoder does not take (e.g. 4:2:2); try one real frame first.
+    p = Gst.parse_launch(f"appsrc name=src caps=image/jpeg,width={w},height={h},framerate=30/1 ! jpegparse ! {dec} ! "
+                         "videoconvert ! videoflip method=clockwise ! videoconvert ! video/x-raw,format=BGR ! fakesink")
+    p.set_state(Gst.State.PLAYING)
+    src = p.get_by_name("src")
+    src.emit("push-buffer", Gst.Buffer.new_wrapped(jpeg))
+    src.emit("end-of-stream")
+    msg = p.get_bus().timed_pop_filtered(5 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
+    p.set_state(Gst.State.NULL)
+    return msg is not None and msg.type == Gst.MessageType.EOS
 ENCODER = "vah264enc" if Gst.ElementFactory.find("vah264enc") else "x264enc speed-preset=veryfast"
 
 state = {"delay": 30, "rots": {}, "layout": "cam0", "zone": None, "autosave": False,
@@ -235,7 +248,7 @@ def save_clip(cam, t0, t1, rot, name):
     tmp = CLIPS / (name + ".part")
     p = Gst.parse_launch(
         f"appsrc name=src format=time block=true caps=image/jpeg,width={cam.w},height={cam.h},framerate={gst_rate(cam.fps)} ! "
-        f"jpegparse ! {DECODER} ! videoflip method={rot} ! videoconvert ! {WATERMARK_GST} ! videoconvert ! video/x-raw,format=NV12 ! "
+        f"jpegparse ! {DECODER} ! videoconvert ! videoflip method={rot} ! videoconvert ! {WATERMARK_GST} ! videoconvert ! video/x-raw,format=NV12 ! "
         f"{ENCODER} ! h264parse ! mp4mux ! filesink name=sink"
     )
     p.get_by_name("sink").set_property("location", str(tmp))  # names may contain spaces
@@ -525,7 +538,7 @@ class Broadcast:
                else f"x264enc speed-preset=veryfast tune=zerolatency bitrate={kbps} key-int-max={key}")
         return (f"appsrc name=src is-live=true do-timestamp=true format=time max-buffers=2 leaky-type=downstream "
                 f"caps=image/jpeg,width={self.cam.w},height={self.cam.h},framerate={gst_rate(self.cam.fps)} ! "
-                f"jpegparse ! {DECODER} ! videoflip method={self.rot} ! videoscale ! videoconvert ! "
+                f"jpegparse ! {DECODER} ! videoconvert ! videoflip method={self.rot} ! videoscale ! videoconvert ! "
                 f"video/x-raw,width={w},height={h},pixel-aspect-ratio=1/1 ! {WATERMARK_GST} ! videoconvert ! "
                 f"video/x-raw,format=NV12 ! {enc} ! h264parse ! queue ! ")
 
@@ -875,7 +888,7 @@ def display_jpeg(cam, rot, sw, sh, conn):
     # One camera full screen: JPEG decoded by the GPU, scaled with black borders, text on top.
     p = Gst.parse_launch(
         f"appsrc name=src is-live=true max-buffers=1 leaky-type=downstream do-timestamp=true format=time caps=image/jpeg,width={cam.w},height={cam.h},framerate={gst_rate(cam.fps)} ! "
-        f"jpegparse ! {DECODER} ! videoflip method={rot} ! videoconvert ! "
+        f"jpegparse ! {DECODER} ! videoconvert ! videoflip method={rot} ! videoconvert ! "
         f"videoscale add-borders=true ! video/x-raw,width={sw},height={sh},pixel-aspect-ratio=1/1 ! "
         'textoverlay name=txt valignment=top halignment=left font-desc="Sans 20" ! '
         f"{WATERMARK_GST} ! "
@@ -1760,6 +1773,16 @@ analyzer.start()
 broadcast = Broadcast(cams[0])
 for c in cams:
     c.start()
+if DECODER != "jpegdec":
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not all(c.times for c in cams):
+        time.sleep(0.05)
+    for c in cams:
+        if c.times and not decoder_works(DECODER, c.read(c.refs[-1]), c.w, c.h):
+            print(f"{DECODER} cannot decode camera {c.idx + 1}, using jpegdec", flush=True)
+            DECODER = "jpegdec"
+            break
+print(f"Decoder: {DECODER}", flush=True)
 cmds = queue.Queue()  # (command, value) from keyboard and web, applied in the main loop
 status = {}  # snapshot for the web page, replaced every loop
 tv_replay = None  # replay looping in a corner of the TV: {"cam", "t0", "t1", "speed", "start"}
